@@ -30,3 +30,9 @@ frontend/*
 
 # DS Store
 .DS_Store
+
+project-RAG/.env
+project-RAG/__pycache__/
+project-RAG/*.pyc
+project-RAG/.streamlit/secrets.toml
+project-RAG/test_insert.py
