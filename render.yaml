@@ -1,21 +1,18 @@
 services:
-  - type: pserv
+  - type: web
     name: endee-vector-db
     runtime: image
-    plan: starter
+    plan: free
     image:
       url: docker.io/endeeio/endee-server:latest
-    disk:
-      name: endee-data
-      mountPath: /data
-      sizeGB: 10
+    healthCheckPath: /api/v1/health
     envVars:
       - key: PORT
         value: "8080"
       - key: NDD_SERVER_PORT
         value: "8080"
       - key: NDD_DATA_DIR
-        value: /data
+        value: /tmp/endee-data
       - key: NDD_NUM_THREADS
         value: "0"
 
@@ -34,7 +31,7 @@ services:
         value: RAGSYS
       - key: ENDEE_HOSTPORT
         fromService:
-          type: pserv
+          type: web
           name: endee-vector-db
           property: hostport
       - key: GROQ_API_KEY
