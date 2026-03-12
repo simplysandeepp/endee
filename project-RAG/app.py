@@ -13,10 +13,34 @@ import msgpack
 load_dotenv()
 
 # Configuration
-ENDEE_URL = os.getenv("ENDEE_URL", "http://localhost:8080")
+def resolve_endee_url():
+    """Resolve Endee URL for local and Render deployments."""
+    explicit_url = os.getenv("ENDEE_URL")
+    if explicit_url:
+        return explicit_url.rstrip("/")
+
+    hostport = os.getenv("ENDEE_HOSTPORT")
+    if hostport:
+        if hostport.startswith("http://") or hostport.startswith("https://"):
+            return hostport.rstrip("/")
+        return f"http://{hostport}".rstrip("/")
+
+    return "http://localhost:8080"
+
+ENDEE_URL = resolve_endee_url()
 INDEX_NAME = os.getenv("INDEX_NAME", "simple_rag")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ENDEE_AUTH_TOKEN = os.getenv("ENDEE_AUTH_TOKEN", "")
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+def endee_headers(content_type_json=False):
+    """Build request headers for Endee API calls."""
+    headers = {}
+    if ENDEE_AUTH_TOKEN:
+        headers["Authorization"] = ENDEE_AUTH_TOKEN
+    if content_type_json:
+        headers["Content-Type"] = "application/json"
+    return headers or None
 
 # Initialize
 @st.cache_resource
@@ -35,7 +59,9 @@ def create_index():
                 "precision": "float32",
                 "M": 16,
                 "ef_construction": 200
-            }
+            },
+            headers=endee_headers(content_type_json=True),
+            timeout=10
         )
         return response.ok
     except:
@@ -85,7 +111,7 @@ def ingest_document(text, model):
         response = requests.post(
             f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/vector/insert",
             json=vectors,
-            headers={"Content-Type": "application/json"},
+            headers=endee_headers(content_type_json=True),
             timeout=30
         )
         
@@ -110,6 +136,7 @@ def search_similar(question, model, top_k=3):
                 "vector": query_embedding.astype(np.float32).tolist(),
                 "k": top_k
             },
+            headers=endee_headers(content_type_json=True),
             timeout=10
         )
         
@@ -169,7 +196,11 @@ st.title("🤖 Simple RAG with Endee")
 
 # Check if Endee is running
 try:
-    response = requests.get(f"{ENDEE_URL}/api/v1/health", timeout=2)
+    response = requests.get(
+        f"{ENDEE_URL}/api/v1/health",
+        headers=endee_headers(),
+        timeout=2
+    )
     st.sidebar.success("✅ Endee Connected")
 except:
     st.sidebar.error("❌ Endee not running! Start Endee first.")
