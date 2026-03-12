@@ -1,146 +1,86 @@
-# Simple RAG Application with Endee Vector Database
+# Project-RAG: Streamlit + Endee + Groq
 
-A minimal RAG (Retrieval-Augmented Generation) system using:
-- **Endee** for vector storage and semantic search
-- **Groq** for fast LLM responses
-- **Streamlit** for simple web interface
+RAG (Retrieval-Augmented Generation) app that:
+- ingests `.txt` documents,
+- stores embeddings in Endee vector DB,
+- retrieves relevant chunks,
+- generates final answers using Groq.
 
-## 🚀 Live Demo
+## Architecture
 
-[Coming soon - Deploy to Streamlit Cloud]
+```mermaid
+flowchart LR
+    U[User in Streamlit UI] --> Q[Question]
+    Q --> E[SentenceTransformer Embedding]
+    E --> S[Endee Search Top-K]
+    S --> C[Context Chunks]
+    C --> L[Groq LLM]
+    L --> A[Final Answer]
 
-## ✨ Features
-
-- Upload text documents and automatically chunk them
-- Semantic search using sentence transformers
-- Fast AI-powered answers using Groq LLM
-- Simple and clean web interface
-- Powered by Endee vector database
-
-## 📋 Prerequisites
-
-- Python 3.8+
-- Endee vector database running (locally or remote)
-- Groq API key
-
-## 🛠️ Local Setup
-
-### 1. Clone the repository
-
-```bash
-git clone <your-repo-url>
-cd project-RAG
+    D[Uploaded Text File] --> CH[Chunking]
+    CH --> DE[Chunk Embeddings]
+    DE --> I[Insert Vectors in Endee]
 ```
 
-### 2. Install dependencies
+## Tech Stack
 
+- Streamlit
+- sentence-transformers (`all-MiniLM-L6-v2`)
+- Endee vector database
+- Groq API
+
+## Local Setup
+
+1. Install dependencies:
 ```bash
+cd project-RAG
 pip install -r requirements.txt
 ```
 
-### 3. Set up environment variables
-
-Copy `.env.example` to `.env` and fill in your values:
-
+2. Create `.env`:
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
-```
-GROQ_API_KEY=your_actual_groq_api_key
+3. Configure `.env`:
+```env
+GROQ_API_KEY=your_groq_api_key
 ENDEE_URL=http://localhost:8080
-INDEX_NAME=RAG
+INDEX_NAME=RAGSYS
 ```
 
-### 4. Start Endee vector database
+4. Start Endee on `http://localhost:8080`.
 
-Make sure Endee is running on `http://localhost:8080`
-
-For local Endee setup, see: [Endee Documentation](https://github.com/endee-io/endee)
-
-### 5. Run the application
-
+5. Run the app:
 ```bash
 streamlit run app.py
 ```
 
-The app will open at `http://localhost:8501`
+6. Open `http://localhost:8501`.
 
-## 📦 Deployment to Streamlit Cloud
+## Environment Variables
 
-### Step 1: Push to GitHub
+- `GROQ_API_KEY`: required for LLM responses.
+- `INDEX_NAME`: index used in Endee.
+- `ENDEE_URL`: full Endee URL (preferred).
+- `ENDEE_HOSTPORT`: optional `host:port` form (useful in Render internal networking).
+- `ENDEE_AUTH_TOKEN`: optional auth token if Endee auth is enabled.
 
-```bash
-# Initialize git (if not already done)
-git init
-git add .
-git commit -m "Initial commit - RAG application"
+## Render Deployment
 
-# Create a new repository on GitHub, then:
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-git branch -M main
-git push -u origin main
-```
+Use the Blueprint file [`../render.yaml`](../render.yaml) to deploy:
+- `endee-vector-db`
+- `project-rag-app`
 
-### Step 2: Deploy on Streamlit Cloud
+Steps:
+1. Push repo to GitHub.
+2. In Render, create a new Blueprint from the repo.
+3. Provide `GROQ_API_KEY`.
+4. Deploy and open the `project-rag-app` URL.
 
-1. Go to [share.streamlit.io](https://share.streamlit.io)
-2. Sign in with GitHub
-3. Click "New app"
-4. Select your repository
-5. Set main file path: `project-RAG/app.py`
-6. Click "Advanced settings" and add secrets:
-   ```
-   GROQ_API_KEY = "your_groq_api_key"
-   ENDEE_URL = "your_endee_url"
-   INDEX_NAME = "RAG"
-   ```
-7. Click "Deploy"
+## Usage
 
-**Note:** For deployment, you'll need a publicly accessible Endee instance. You can:
-- Deploy Endee on a cloud server (AWS, GCP, Azure)
-- Use Docker to deploy Endee
-- Use a tunnel service like ngrok for testing
-
-## 🎯 Usage
-
-1. **Initialize Index**: Click "Initialize Index" in the sidebar (first time only)
-2. **Upload Document**: Upload a `.txt` file
-3. **Ingest**: Click "Ingest Document" to process and store vectors
-4. **Ask Questions**: Type your question and get AI-powered answers based on your documents
-
-## 📝 Example
-
-Upload a document about a village story, then ask:
-- "Who was the engineer living near the banyan tree?"
-- "What problem did the village face?"
-- "How did they solve the drought issue?"
-
-## 🏗️ Architecture
-
-```
-User Question → Embedding → Endee Search → Context → Groq LLM → Answer
-```
-
-## 🔧 Configuration
-
-Edit `.env` to customize:
-- `GROQ_API_KEY`: Your Groq API key
-- `ENDEE_URL`: Endee server URL
-- `INDEX_NAME`: Vector index name
-
-## 📄 License
-
-MIT License
-
-## 🤝 Contributing
-
-Contributions welcome! Please open an issue or submit a pull request.
-
-## 📞 Support
-
-For issues or questions:
-- Endee: [https://github.com/endee-io/endee](https://github.com/endee-io/endee)
-- Groq: [https://console.groq.com](https://console.groq.com)
-
+1. Click `Initialize Index`.
+2. Upload a `.txt` file.
+3. Click `Ingest Document`.
+4. Ask questions in the input box.
