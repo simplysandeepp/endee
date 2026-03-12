@@ -52,7 +52,7 @@ Copy the https URL (e.g., `https://abc-123-def.ngrok-free.app`)
 5. Click **"Advanced settings"**
 6. In the **Secrets** box, paste:
    ```toml
-   GROQ_API_KEY = "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"
+   GROQ_API_KEY = "your_actual_groq_api_key_here"
    ENDEE_URL = "YOUR_ENDEE_PUBLIC_URL"
    INDEX_NAME = "RAG"
    ```
