@@ -1,19 +1,18 @@
-"""Simple RAG Application with Streamlit UI"""
-import streamlit as st
-import requests
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from groq import Groq
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-import msgpack
+﻿"""Simple RAG app with Streamlit, Endee, and Groq."""
 
-# Load environment variables from .env file
+import os
+
+import msgpack
+import numpy as np
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+from groq import Groq
+
 load_dotenv()
 
-# Configuration
-def resolve_endee_url():
+
+def resolve_endee_url() -> str:
     """Resolve Endee URL for local and Render deployments."""
     explicit_url = os.getenv("ENDEE_URL")
     if explicit_url:
@@ -27,13 +26,15 @@ def resolve_endee_url():
 
     return "http://localhost:8080"
 
+
 ENDEE_URL = resolve_endee_url()
 INDEX_NAME = os.getenv("INDEX_NAME", "simple_rag")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ENDEE_AUTH_TOKEN = os.getenv("ENDEE_AUTH_TOKEN", "")
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-def endee_headers(content_type_json=False):
+
+def endee_headers(content_type_json: bool = False):
     """Build request headers for Endee API calls."""
     headers = {}
     if ENDEE_AUTH_TOKEN:
@@ -42,13 +43,30 @@ def endee_headers(content_type_json=False):
         headers["Content-Type"] = "application/json"
     return headers or None
 
-# Initialize
+
+def is_endee_available() -> bool:
+    """Check Endee health endpoint."""
+    try:
+        response = requests.get(
+            f"{ENDEE_URL}/api/v1/health",
+            headers=endee_headers(),
+            timeout=2,
+        )
+        return response.ok
+    except Exception:
+        return False
+
+
 @st.cache_resource
 def load_embedding_model():
+    """Lazy-load embedding model."""
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer(EMBEDDING_MODEL)
 
-def create_index():
-    """Create vector index in Endee"""
+
+def create_index() -> bool:
+    """Create vector index in Endee."""
     try:
         response = requests.post(
             f"{ENDEE_URL}/api/v1/index/create",
@@ -58,121 +76,113 @@ def create_index():
                 "space": "cosine",
                 "precision": "float32",
                 "M": 16,
-                "ef_construction": 200
+                "ef_construction": 200,
             },
             headers=endee_headers(content_type_json=True),
-            timeout=10
+            timeout=10,
         )
         return response.ok
-    except:
+    except Exception:
         return False
 
-def chunk_text(text, chunk_size=500):
-    """Split text into chunks"""
+
+def chunk_text(text: str, chunk_size: int = 500):
+    """Split text into chunks by word count."""
     words = text.split()
-    if len(words) == 0:
+    if not words:
         return []
-    
+
     chunks = []
     for i in range(0, len(words), chunk_size):
-        chunk = " ".join(words[i:i + chunk_size])
-        if chunk.strip():  # Only add non-empty chunks
+        chunk = " ".join(words[i : i + chunk_size])
+        if chunk.strip():
             chunks.append(chunk)
-    
-    # If text is shorter than chunk_size, return it as single chunk
-    if len(chunks) == 0 and text.strip():
-        chunks.append(text)
-    
     return chunks
 
-def ingest_document(text, model):
-    """Ingest document into Endee"""
+
+def ingest_document(text: str, model) -> int:
+    """Ingest document chunks into Endee."""
     chunks = chunk_text(text)
-    
-    if len(chunks) == 0:
-        st.error("No chunks created from text!")
+    if not chunks:
+        st.error("No chunks created from text.")
         return 0
-    
+
     st.info(f"Created {len(chunks)} chunks from document")
-    
     embeddings = model.encode(chunks, normalize_embeddings=True)
-    
+
     vectors = []
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        # Convert to float32 explicitly
-        vector_data = embedding.astype(np.float32).tolist()
-        vectors.append({
-            "id": str(i),
-            "vector": vector_data,
-            "meta": chunk
-        })
-    
+        vectors.append(
+            {
+                "id": str(i),
+                "vector": embedding.astype(np.float32).tolist(),
+                "meta": chunk,
+            }
+        )
+
     try:
         response = requests.post(
             f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/vector/insert",
             json=vectors,
             headers=endee_headers(content_type_json=True),
-            timeout=30
+            timeout=30,
         )
-        
+
         if response.ok:
-            st.success(f"Successfully inserted {len(chunks)} vectors into Endee")
+            st.success(f"Inserted {len(chunks)} vectors into Endee")
             return len(chunks)
-        else:
-            st.error(f"Endee API error: {response.status_code} - {response.text}")
-            return 0
-    except Exception as e:
-        st.error(f"Error inserting into Endee: {str(e)}")
+
+        st.error(f"Endee API error: {response.status_code} - {response.text}")
+        return 0
+    except Exception as exc:
+        st.error(f"Error inserting into Endee: {exc}")
         return 0
 
-def search_similar(question, model, top_k=3):
-    """Search for similar chunks"""
+
+def search_similar(question: str, model, top_k: int = 3):
+    """Search Endee for relevant chunks."""
     query_embedding = model.encode([question])[0]
-    
+
     try:
         response = requests.post(
             f"{ENDEE_URL}/api/v1/index/{INDEX_NAME}/search",
-            json={
-                "vector": query_embedding.astype(np.float32).tolist(),
-                "k": top_k
-            },
+            json={"vector": query_embedding.astype(np.float32).tolist(), "k": top_k},
             headers=endee_headers(content_type_json=True),
-            timeout=10
+            timeout=10,
         )
-        
-        if response.ok:
-            # Decode MessagePack response
-            results = msgpack.unpackb(response.content, raw=False)
-            
-            contexts = []
-            if isinstance(results, list):
-                for r in results:
-                    if isinstance(r, dict) and "meta" in r:
-                        meta = r["meta"]
-                        # Convert bytes to string if needed
-                        if isinstance(meta, bytes):
-                            meta = meta.decode('utf-8')
-                        contexts.append(meta)
-                    elif isinstance(r, list) and len(r) > 2:
-                        # Format: [id, distance, meta]
-                        meta = r[2]
-                        if isinstance(meta, bytes):
-                            meta = meta.decode('utf-8')
-                        contexts.append(meta)
-            
-            return contexts
-        return []
-    except Exception as e:
-        st.error(f"Search error: {str(e)}")
+
+        if not response.ok:
+            return []
+
+        results = msgpack.unpackb(response.content, raw=False)
+        contexts = []
+
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, dict) and "meta" in item:
+                    meta = item["meta"]
+                elif isinstance(item, list) and len(item) > 2:
+                    meta = item[2]
+                else:
+                    continue
+
+                if isinstance(meta, bytes):
+                    meta = meta.decode("utf-8", errors="replace")
+                contexts.append(meta)
+
+        return contexts
+    except Exception as exc:
+        st.error(f"Search error: {exc}")
         return []
 
-def generate_answer(question, context):
-    """Generate answer using Groq"""
+
+def generate_answer(question: str, context: str) -> str:
+    """Generate answer using Groq."""
     if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_api_key_here":
-        return "⚠️ Please add your Groq API key in the .env file"
-    
+        return "Please add GROQ_API_KEY."
+
     client = Groq(api_key=GROQ_API_KEY)
-    
+
     prompt = f"""Based on the following context, answer the question.
 
 Context:
@@ -181,75 +191,70 @@ Context:
 Question: {question}
 
 Answer:"""
-    
+
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
-        max_tokens=500
+        max_tokens=500,
     )
-    
+
     return response.choices[0].message.content
 
-# Streamlit UI
-st.title("🤖 Simple RAG with Endee")
 
-# Check if Endee is running
-try:
-    response = requests.get(
-        f"{ENDEE_URL}/api/v1/health",
-        headers=endee_headers(),
-        timeout=2
-    )
-    st.sidebar.success("✅ Endee Connected")
-except:
-    st.sidebar.error("❌ Endee not running! Start Endee first.")
-    st.stop()
+st.title("Simple RAG with Endee")
 
-# Check API key
-if GROQ_API_KEY and GROQ_API_KEY != "your_groq_api_key_here":
-    st.sidebar.success("✅ Groq API Key Loaded")
+endee_available = is_endee_available()
+if endee_available:
+    st.sidebar.success("Endee connected")
 else:
-    st.sidebar.warning("⚠️ Add Groq API key in .env file")
+    st.sidebar.error("Endee unavailable")
+    st.info("Vector DB is unreachable right now. Retry after Endee wakes up.")
 
-# Initialize index
-if st.sidebar.button("Initialize Index"):
+if GROQ_API_KEY and GROQ_API_KEY != "your_groq_api_key_here":
+    st.sidebar.success("Groq key loaded")
+else:
+    st.sidebar.warning("Set GROQ_API_KEY")
+
+if st.sidebar.button("Initialize Index", disabled=not endee_available):
     if create_index():
-        st.sidebar.success("Index created!")
+        st.sidebar.success("Index created")
     else:
-        st.sidebar.info("Index already exists or created")
+        st.sidebar.info("Index already exists or request failed")
 
-# Document upload
-st.header("📄 Upload Document")
+st.header("Upload Document")
 uploaded_file = st.file_uploader("Upload a text file", type=["txt"])
 
-if uploaded_file and st.button("Ingest Document"):
+if uploaded_file and st.button("Ingest Document", disabled=not endee_available):
     model = load_embedding_model()
-    text = uploaded_file.read().decode("utf-8")
-    
+    text = uploaded_file.read().decode("utf-8", errors="replace")
+
     with st.spinner("Processing document..."):
         num_chunks = ingest_document(text, model)
-    
-    st.success(f"✅ Ingested {num_chunks} chunks!")
 
-# Query interface
-st.header("💬 Ask Questions")
+    st.success(f"Ingested {num_chunks} chunks")
+
+st.header("Ask Questions")
 question = st.text_input("Enter your question:")
 
 if question:
+    if not endee_available:
+        st.warning("Endee is unavailable, so search cannot run yet.")
+        st.stop()
+
     model = load_embedding_model()
-    
+
     with st.spinner("Searching..."):
         contexts = search_similar(question, model)
-    
+
     if contexts:
         with st.spinner("Generating answer..."):
             context_text = "\n\n".join(contexts)
             answer = generate_answer(question, context_text)
-        
+
         st.markdown("### Answer")
         st.write(answer)
-        
+
         with st.expander("View Sources"):
             for i, ctx in enumerate(contexts, 1):
                 st.markdown(f"**Source {i}:**")
