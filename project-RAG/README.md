@@ -1,4 +1,4 @@
-# Project-RAG: Streamlit + Endee + Groq
+# Project-RAG: Streamlit + Endee + GroqWWW
 
 RAG (Retrieval-Augmented Generation) app that:
 - ingests `.txt` documents,
