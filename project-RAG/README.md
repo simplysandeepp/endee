@@ -2,6 +2,7 @@
 
 **Retrieval-Augmented Generation (RAG) application** built with Streamlit, Endee Vector Database, and Groq LLM — developed as part of the Endee.io Campus Recruitment Assignment.
 
+[![Demo Video](https://img.shields.io/badge/Demo-Watch%20Video-red?style=for-the-badge&logo=youtube)](https://youtu.be/zrxBGdZGPnc)
 ---
 
 ## 📋 Table of Contents
