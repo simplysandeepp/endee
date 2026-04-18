@@ -4,6 +4,7 @@
 
 #include "hnsw/hnswlib.h"
 #include "settings.hpp"
+#include "types.hpp"
 #include "id_mapper.hpp"
 #include "vector_storage.hpp"
 #include "../sparse/sparse_storage.hpp"
@@ -19,6 +20,7 @@
 #include <list>
 #include <algorithm>
 #include <mutex>
+#include <shared_mutex>
 #include <chrono>
 #include <filesystem>
 #include <thread>
@@ -30,7 +32,7 @@
 
 struct IndexConfig {
     size_t dim;
-    size_t sparse_dim = 0;  // 0 means dense-only
+    ndd::SparseScoringModel sparse_model = ndd::SparseScoringModel::NONE;
     size_t max_elements = settings::MAX_ELEMENTS;
     std::string space_type_str;
     size_t M = settings::DEFAULT_M;
@@ -43,7 +45,7 @@ struct IndexConfig {
 struct IndexInfo {
     size_t total_elements;
     size_t dimension;
-    size_t sparse_dim;
+    ndd::SparseScoringModel sparse_model = ndd::SparseScoringModel::NONE;
     std::string space_type_str;
     ndd::quant::QuantizationLevel
             quant_level;  // Selected quantization level
@@ -54,31 +56,88 @@ struct IndexInfo {
 
 struct CacheEntry {
     std::string index_id;
-    size_t sparse_dim = 0;
+    ndd::SparseScoringModel sparse_model = ndd::SparseScoringModel::NONE;
     std::unique_ptr<hnswlib::HierarchicalNSW<float>> alg;
     std::shared_ptr<IDMapper> id_mapper;
     std::shared_ptr<VectorStorage> vector_storage;
     std::unique_ptr<ndd::SparseVectorStorage> sparse_storage;
+    std::unique_ptr<WriteAheadLog> wal;
     std::chrono::system_clock::time_point last_access;
     std::chrono::system_clock::time_point last_saved_at;
-    std::chrono::system_clock::time_point updated_at;
-    // Flag to indicate if the index has been updated
-    bool updated{false};
-    // Number of searches performed on this index. For a search with k=10 it will be 10
+    std::chrono::system_clock::time_point last_dirtied_at;
+
+    /**
+     * Indicates if the index has unsaved in-memory changes
+     * is_dirty = true -> the index has not been persisted in storage
+     */
+    bool is_dirty{false};
+
+    /**
+     * cache_valid marks whether this CacheEntry is still the active entry
+     * for its index_id.
+     *
+     * This is needed because the per-thread cache stores weak_ptr<CacheEntry>.
+     * A weak_ptr only tells us whether the old CacheEntry object is still alive;
+     * it does not tell us whether that object is still the current entry in
+     * IndexManager::indices_.
+     *
+     * After delete/evict/reload, the old CacheEntry may still remain alive
+     * because in-flight readers still hold shared_ptr references to it. In that
+     * window, weak_ptr.lock() can still succeed. cache_valid prevents new lookups
+     * from reusing that stale entry while allowing existing users of the entry to
+     * finish safely.
+     *
+     * NOTE: This need not be an atomic bool because its a huge performance penalty
+     * and negligible correctness improvement.
+     */
+    bool cache_valid{true};
+
+    /**
+     * Number of searches performed on this index. For a search with k=10
+     * it will be 10
+     *
+     * NOTE: Since there can be multiple readers hitting the same index,
+     * there is no guarantee that this number will capture the true searchCount.
+     * using std::atomics will levy (~10%) performance penalty.
+     */
     size_t searchCount{0};
-    // Per-index operation mutex for coordinating addVectors, saveIndex, deleteVectors
-    std::mutex operation_mutex;
+
+    /**
+     * Per-index reader's - writer's operation lock
+     *
+     * writers: addVectors, saveIndexInternal, saveIndex, deleteVectors,
+     * evictIfNeeded, recoverIndex, deleteVectorsByFilter, updateFilters,
+     * deleteIndex, executeBackupJob
+     *
+     * readers: searchKNN, getVector, getIndexInfo (loaded-index path only)
+     *
+     * NOTE: std::shared_mutex dont guarantee fairness between
+     * readers and writers. ie. currently it could be the case that either
+     * reads or writes can starve if other is being flooded.
+     *
+     * TODO: If that is required, we will have to implement a custom reader-writer
+     * locking mechanism with a ticketing system to guarantee fairness.
+     *
+     * XXX: We want readers to work even when writers are happening on an index
+     * If we use a reader's lock in read path, long running writes will starve 
+     * them. So for now, we are not using readers lock. This doesnt affect
+     * correctness for now. Access-after-delete errors are handled by making
+     * CacheEntry a shared_ptr in IndexManager.
+     * TODO: Revisit the locking mechanism to make it finegrained for performance.
+     */
+    std::shared_mutex operation_mutex;
 
     // Default constructor required for map
     CacheEntry() :
         last_access(std::chrono::system_clock::now()) {}
 
     CacheEntry(std::string index_id_,
-               size_t sparse_dim_,
+               ndd::SparseScoringModel sparse_model_,
                std::unique_ptr<hnswlib::HierarchicalNSW<float>> alg_,
                std::shared_ptr<IDMapper> mapper_,
                std::shared_ptr<VectorStorage> storage_,
                std::unique_ptr<ndd::SparseVectorStorage> sparse_storage_,
+               std::unique_ptr<WriteAheadLog> wal_,
                std::chrono::system_clock::time_point access_time_) {
         LOG_INFO(2001, index_id_, "Creating cache entry");
 
@@ -98,13 +157,14 @@ struct CacheEntry {
 
         LOG_INFO(2005, index_id_, "Assigning index id");
         index_id = std::move(index_id_);
-        sparse_dim = sparse_dim_;
+        sparse_model = sparse_model_;
 
         id_mapper = std::move(mapper_);
 
         vector_storage = std::move(storage_);
 
         sparse_storage = std::move(sparse_storage_);
+        wal = std::move(wal_);
 
         last_access = access_time_;
 
@@ -116,9 +176,9 @@ struct CacheEntry {
         LOG_INFO(2007, index_id, "Cache entry construction completed");
     }
 
-    void markUpdated() {
-        updated = true;
-        updated_at = std::chrono::system_clock::now();
+    void markDirty() {
+        is_dirty = true;
+        last_dirtied_at = std::chrono::system_clock::now();
     }
     void resetSearchCount() { searchCount = 0; }
     // Delete copy constructor and assignment
@@ -141,11 +201,17 @@ struct PersistenceConfig {
 class IndexManager {
 private:
     std::deque<std::string> indices_list_;
-    std::unordered_map<std::string, CacheEntry> indices_;
+    std::unordered_map<std::string, std::shared_ptr<CacheEntry>> indices_;
+
+    /**
+     * This is a thread local store(TLS) for the indices_. ie. hot indices
+     * need not look at indices_ and take a global lock repeatedly.
+     * look at getIndexEntry() for more.
+     */
+    inline static thread_local std::unordered_map<std::string, std::weak_ptr<CacheEntry>>
+            per_thread_indices_;
     std::shared_mutex indices_mutex_;
     std::string data_dir_;
-    // This is for locking the LRU
-    std::shared_mutex active_indices_mutex_;
     PersistenceConfig persistence_config_;
     std::atomic<bool> shutdown_requested_{false};
     std::condition_variable persistence_cv_;
@@ -153,36 +219,30 @@ private:
     // Autosave methods
     std::thread autosave_thread_;
     std::atomic<bool> running_{true};
-    // Write-ahead log for each index
-    std::unordered_map<std::string, std::unique_ptr<WriteAheadLog>> wal_logs_;
     BackupStore backup_store_;
-    void executeBackupJob(const std::string& index_id, const std::string& backup_name);
+    void executeBackupJob(const std::string& index_id, const std::string& backup_name,
+                          std::stop_token st);
 
-    // New methods to handle WAL
-    WriteAheadLog* getOrCreateWAL(const std::string& index_id) {
-        auto it = wal_logs_.find(index_id);
-        if(it != wal_logs_.end()) {
-            return it->second.get();
-        }
-
-        std::string wal_dir = data_dir_ + "/" + index_id;
-        auto wal = std::make_unique<WriteAheadLog>(wal_dir, index_id);
-        auto wal_ptr = wal.get();
-        wal_logs_[index_id] = std::move(wal);
-        return wal_ptr;
+    std::unique_ptr<WriteAheadLog> createWAL(const std::string& index_id) {
+        const std::string wal_dir = data_dir_ + "/" + index_id;
+        return std::make_unique<WriteAheadLog>(wal_dir, index_id);
     }
 
-    void clearWAL(const std::string& index_id) {
-        auto it = wal_logs_.find(index_id);
-        if(it != wal_logs_.end()) {
-            it->second->clear();
+    WriteAheadLog* getOrCreateWAL(CacheEntry& entry) {
+        if(!entry.wal) {
+            entry.wal = createWAL(entry.index_id);
         }
+        return entry.wal.get();
+    }
+
+    void clearWAL(CacheEntry& entry) {
+        getOrCreateWAL(entry)->clear();
     }
 
     // Helper method for WAL recovery
-    void recoverFromWAL(const std::string& index_id) {
-        auto& entry = getIndexEntry(index_id);
-        WriteAheadLog* wal = getOrCreateWAL(index_id);
+    void recoverFromWAL(CacheEntry& entry) {
+        const std::string& index_id = entry.index_id;
+        WriteAheadLog* wal = getOrCreateWAL(entry);
 
         // Check if WAL has entries needing recovery
         if(wal->hasEntries()) {
@@ -239,8 +299,8 @@ private:
                                             << " failed VECTOR_ADD ids for reuse");
             }
 
-            // Mark as updated to trigger a save
-            entry.markUpdated();
+            // Mark as dirty to trigger a save
+            entry.markDirty();
             // Explicitly save the index after recovery
             LOG_DEBUG("Saving index after WAL recovery: " << index_id);
             // Save index will also clear the WAL and save bloom filter
@@ -253,8 +313,8 @@ private:
     void autosaveLoop() {
         LOG_INFO(2011, "Autosave thread started");
         while(running_) {
-            // Sleep for 5 minutes
-            std::this_thread::sleep_for(std::chrono::minutes(5));
+            // Sleep for AUTOSAVE_SLEEP_MINUTES
+            std::this_thread::sleep_for(std::chrono::minutes(settings::AUTOSAVE_SLEEP_MINUTES));
 
             // Check if we're still running
             if(!running_) {
@@ -266,59 +326,110 @@ private:
         LOG_INFO(2013, "Autosave thread stopped");
     }
 
-    // Check and save indices based on update time
+    // Check and save indices based on when they were last dirtied
     void checkAndSaveIndices() {
         std::vector<std::string> indices_to_save;
         auto now = std::chrono::system_clock::now();
 
-        // First identify indices to save (without holding main mutex for too long)
+        /**
+         * Identify the dirty indices without holding indices_mutex_ for too long
+         */
         {
-            for(auto& [index_id, entry] : indices_) {
-                if(entry.updated) {
-                    auto time_since_update = now - entry.updated_at;
-                    // Save if more than 60 minutes since update
-                    if(time_since_update > std::chrono::minutes(60)) {
+            std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
+            for(const auto& [index_id, entry] : indices_) {
+                if(entry && entry->is_dirty) {
+                    auto time_since_dirtied = now - entry->last_dirtied_at;
+                    // Save if more than SAVE_EVERY_N_MINUTES minutes since the last mutation
+                    if(time_since_dirtied
+                       > std::chrono::minutes(settings::SAVE_EVERY_N_MINUTES)) {
                         indices_to_save.push_back(index_id);
                     }
                 }
             }
         }
 
-        // Now save each index individually
+        /* Write each dirty index back */
         for(const auto& index_id : indices_to_save) {
-            auto it = indices_.find(index_id);
-            if(it != indices_.end() && it->second.updated) {
+            bool should_save = false;
+            {
+                std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
+                auto it = indices_.find(index_id);
+                should_save = (it != indices_.end() && it->second && it->second->is_dirty);
+            }
+
+            if(should_save) {
                 LOG_DEBUG("Auto-saving index (60-minute threshold): " << index_id);
                 saveIndex(index_id);
             }
         }
     }
 
-    // Get index entry with proper lock management - does NOT hold locks after return
-    CacheEntry& getIndexEntry(const std::string& index_id) {
-        // First try to find the index without write lock
-        {
-            //std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
-            auto it = indices_.find(index_id);
-            if(it != indices_.end()) {
-                return it->second;
+    /**
+     * Returns the CacheEntry if it is resident in memory.
+     */
+    std::shared_ptr<CacheEntry> findInMemoryIndexEntry(const std::string& index_id) {
+
+        /**
+         * First check the entry in thread local storage (TLS)
+         * indices_ will be referred only if:
+         * 1. index_id is not found
+         * 2. entry is not pointing to a valid shared_ptr
+         * 3. entry is pointing to a valid shared_ptr but cache_valid == false
+         */
+        auto cached_it = per_thread_indices_.find(index_id);
+        if(cached_it != per_thread_indices_.end()) {
+            auto entry = cached_it->second.lock();
+            if(entry && entry->cache_valid) {
+                return entry;
             }
+            per_thread_indices_.erase(cached_it);
         }
 
-        // Index not found, need to load it with write lock
+        /**
+         * Second check if this index is in global indices_.
+         * A read lock on indices_mutex_ is enough for this.
+         */
+        std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
+        auto it = indices_.find(index_id);
+        if(it == indices_.end() || !it->second || !it->second->cache_valid) {
+            return nullptr;
+        }
+
+        //update TLS indices_
+        auto entry = it->second;
+        per_thread_indices_[index_id] = entry;
+
+        return entry;
+    }
+
+    /**
+     * Returns the shared_ptr to CacheEntry
+     * 1. If Index is active (in-memory), return from there
+     * 2. Else, fetch from disk, make active and then return.
+     */
+    std::shared_ptr<CacheEntry> getIndexEntry(const std::string& index_id) {
+        if(auto entry = findInMemoryIndexEntry(index_id)) {
+            return entry;
+        }
+
+        /**
+         * Index not found in memory.
+         * Hold a write lock on indices_mutex_ and fetch it from disk
+         */
         {
             std::unique_lock<std::shared_mutex> write_lock(indices_mutex_);
             auto it = indices_.find(index_id);
             if(it == indices_.end()) {
+                ensureLiveIndexCapacity(index_id, "load index");
                 loadIndex(index_id);  // modifies indices_
-                evictIfNeeded();      // Clean eviction only
             }
             it = indices_.find(index_id);
             if(it == indices_.end()) {
-                throw std::runtime_error("[ERROR] Failed to load index");
+                throw std::runtime_error("[ERROR] Index " + index_id + " doesnt exist.");
             }
-            // Return reference - write_lock will be released when this scope ends
-            return it->second;
+            auto entry = it->second;
+            per_thread_indices_[index_id] = entry;
+            return entry;
         }
     }
 
@@ -326,21 +437,21 @@ private:
         LOG_DEBUG("saveIndex called for index=" + index_id);
 
         // Get the index entry (thread-safe)
-        auto& entry = getIndexEntry(index_id);
+        auto entry = getIndexEntry(index_id);
 
         // Use per-index operation mutex to prevent concurrent operations
-        std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+        std::unique_lock<std::shared_mutex> operation_lock(entry->operation_mutex);
 
         // Call internal implementation
-        saveIndexInternal(entry);
+        saveIndexInternal(*entry);
     }
 
 private:
     // Internal saveIndex implementation that doesn't call getIndexEntry
     // Used by functions that already have the entry and mutex
     void saveIndexInternal(CacheEntry& entry) {
-        // Double check if the index is still updated
-        if(!entry.updated) {
+        // Double check if the index is still dirty
+        if(!entry.is_dirty) {
             return;
         }
         LOG_DEBUG("Saving index " << entry.index_id);
@@ -373,92 +484,87 @@ private:
         std::filesystem::rename(temp_path, index_path);
 
         // Clear the WAL
-        clearWAL(entry.index_id);
+        clearWAL(entry);
 
         // Update element count in metadata
         if(!metadata_manager_->updateElementCount(entry.index_id, entry.alg->getElementsCount())) {
             LOG_WARN(
                     2014, entry.index_id, "Failed to update element count in metadata");
         }
-        entry.updated = false;
+        entry.is_dirty = false;
     }
 
 public:
-    // Evict the last index if the total size exceeds the limit
+
+    /**
+     * TODO:
+     * This function is currently triggered by:
+     * 1.
+     * 2.
+     *
+     * For more look at docs/memory_management.md
+     */
     void evictIfNeeded() {
-        // Go through indices and get the total size. If it exceeds the limit, evict the last one
-        size_t total_size = 0;
-        for(auto& [index_id, entry] : indices_) {
-            if(entry.alg) {
-                total_size += entry.alg->getApproxSizeGB();
+        size_t max_attempts = std::max(indices_list_.size(), indices_.size());
+        while(indices_.size() >= settings::MAX_LIVE_INDICES && max_attempts > 0) {
+            if(indices_list_.empty()) {
+                LOG_ERROR(2048, "Cannot evict index: indices_list_ is empty while cache is full");
+                return;
             }
-        }
-        if(total_size > settings::MAX_MEMORY_GB) {
-            // Make sure that there is at least one index in memory and we use only 80% of the total
-            // size
-            while((total_size > 0.80 * settings::MAX_MEMORY_GB) && (indices_list_.size() > 1)) {
-                // Pop from the back of the active indices list
-                std::string to_evict = indices_list_.back();
+
+            std::string to_evict = indices_list_.back();
+            auto it = indices_.find(to_evict);
+            if(it == indices_.end()) {
+                LOG_WARN(2049, to_evict, "Dropping stale eviction candidate from indices_list_");
                 indices_list_.pop_back();
-                auto it = indices_.find(to_evict);
-                if(it != indices_.end()) {
-                    total_size -= it->second.alg->getApproxSizeGB();
-
-                    // Only evict if the index is not dirty (hasn't been updated)
-                    if(it->second.updated) {
-                        LOG_WARN(2015, to_evict, "Cannot evict dirty index; it must be saved first");
-                        // Put it back at the front to try other indices
-                        indices_list_.push_front(to_evict);
-                        continue;
-                    }
-
-                    LOG_INFO(2016, to_evict, "Evicting clean index from cache");
-                    indices_.erase(it);
-                }
+                --max_attempts;
+                continue;
             }
+
+            try {
+                auto entry = it->second;
+                std::unique_lock<std::shared_mutex> operation_lock(entry->operation_mutex);
+                if(entry->is_dirty) {
+                    LOG_INFO(2050, to_evict, "Saving dirty index before eviction");
+                    saveIndexInternal(*entry);
+                }
+            } catch(const std::exception& e) {
+                LOG_ERROR(2051, to_evict, "Failed to save dirty index during eviction: " << e.what());
+                return;
+            }
+
+            if(it->second->is_dirty) {
+                LOG_WARN(2054, to_evict, "Index remained dirty after forced save; aborting eviction");
+                return;
+            }
+
+            LOG_INFO(2016, to_evict, "Evicting clean index from cache");
+            it->second->cache_valid = false;
+            indices_.erase(it);
+            indices_list_.pop_back();
+            --max_attempts;
+        }
+
+        if(indices_.size() >= settings::MAX_LIVE_INDICES) {
+            LOG_ERROR(2052,
+                      "Eviction attempts exhausted while live index cache remains at limit");
         }
     }
 
-    // Function to be called by cron job instead of running as a thread
-    bool autoSave() {
-        std::vector<std::string> indices_to_save;
-
-        for(const auto& [index_id, entry] : indices_) {
-            if(entry.updated) {  // Check the flag in CacheEntry
-                indices_to_save.push_back(index_id);
-            }
+    void ensureLiveIndexCapacity(const std::string& index_id, const char* action) {
+        if(indices_.size() < settings::MAX_LIVE_INDICES) {
+            return;
         }
 
-        // Now save each index that needs saving
-        bool saved_any = false;
-        for(const auto& index_id : indices_to_save) {
-            LOG_DEBUG("Auto-saving index: " << index_id);
-
-            // Check if index still exists and needs saving (thread-safe)
-            bool should_save = false;
-            {
-                std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
-                auto it = indices_.find(index_id);
-                should_save = (it != indices_.end() && it->second.updated);
-            }
-
-            if(should_save) {
-                LOG_DEBUG("Autosaving index: " << index_id);
-                saveIndex(index_id);
-
-                // Reset the flag after saving (thread-safe)
-                {
-                    std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
-                    auto it = indices_.find(index_id);
-                    if(it != indices_.end()) {
-                        it->second.updated = false;
-                    }
-                }
-                saved_any = true;
-            }
+        evictIfNeeded();
+        if(indices_.size() >= settings::MAX_LIVE_INDICES) {
+            LOG_ERROR(2047,
+                      index_id,
+                      "Unable to " << action << ": live index cache remains at limit "
+                                    << settings::MAX_LIVE_INDICES);
+            throw std::runtime_error("Unable to " + std::string(action)
+                                     + ": live index cache is full");
         }
-
-        return saved_any;
     }
 
     std::string getUserPath(const std::string& username) { return data_dir_ + "/" + username; }
@@ -468,9 +574,8 @@ public:
     }
 
 public:
-    IndexManager(size_t max_indices,
-                 const std::string& data_dir,
-                 const PersistenceConfig& persistence_config = PersistenceConfig{}) :
+    IndexManager(const std::string& data_dir,
+                const PersistenceConfig& persistence_config = PersistenceConfig{}) :
         data_dir_(data_dir),
         persistence_config_(persistence_config),
         backup_store_(data_dir) {
@@ -481,34 +586,53 @@ public:
     }
 
     ~IndexManager() {
-        // Signal autosave thread to stop
+        // Signal all threads to stop (running_ is checked by autosave and backup threads)
         running_ = false;
 
-        // Don't wait for autosave thread to exit. This allows quick restart
+        // Join background backup threads before destroying members
+        // (prevents use-after-free when detached threads outlive IndexManager)
+        backup_store_.joinAllThreads();
+
+        /**
+         * Don't wait for autosave thread to exit.
+         * Since the thread might be sleeping, waiting for join
+         * would be time consuming.
+         *
+         * TODO: This is a stop-gap solution.
+         * Fix it with conditional variables.
+         */
         if(autosave_thread_.joinable()) {
             autosave_thread_.detach();
         }
+
+        /**
+         * Persist all the dirty indices to disk.
+         */
         if(persistence_config_.save_on_shutdown) {
             shutdown_requested_ = true;
             persistence_cv_.notify_all();
-            LOG_DEBUG("Saving indices during shutdown");
-            for(const auto& pair : indices_) {
-                try {
-                    // Only save indices that have been updated since last save
-                    if(pair.second.updated) {
-                        LOG_DEBUG("Saving updated index " << pair.first << " during shutdown");
-                        saveIndex(pair.first);
+            LOG_INFO("Saving indices during shutdown");
+            std::vector<std::string> indices_to_save;
+            {
+                std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
+                for(const auto& pair : indices_) {
+                    if(pair.second && pair.second->is_dirty) {
+                        indices_to_save.push_back(pair.first);
                     }
+                }
+            }
+            for(const auto& index_id : indices_to_save) {
+                try {
+                    LOG_INFO(2017, index_id, "Saving dirty index during shutdown");
+                    saveIndex(index_id);
                 } catch(const std::exception& e) {
-                    LOG_ERROR(2017,
-                                    pair.first,
+                    LOG_ERROR(2015,
+                                    index_id,
                                     "Failed to save index during shutdown: " << e.what());
                 }
             }
-            LOG_DEBUG("Shutdown complete");
+            LOG_INFO("Shutdown complete");
         }
-        // Clear WAL logs
-        wal_logs_.clear();
     }
 
     // Reset the index file. It does not affect the LMDB or metadata.
@@ -599,7 +723,7 @@ public:
         // Evict if needed (clean indices only)
         {
             std::unique_lock<std::shared_mutex> temp_lock(indices_mutex_);
-            evictIfNeeded();
+            ensureLiveIndexCapacity(index_id, "create index");
         }
 
         hnswlib::SpaceType space_type = hnswlib::getSpaceType(config.space_type_str);
@@ -621,9 +745,10 @@ public:
 
         // Initialize Sparse Storage if needed
         std::unique_ptr<ndd::SparseVectorStorage> sparse_storage = nullptr;
-        if(config.sparse_dim > 0) {
+        if(ndd::sparseModelEnabled(config.sparse_model)) {
             std::string sparse_storage_dir = index_dir + "/sparse";
-            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(sparse_storage_dir, index_id);
+            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(
+                sparse_storage_dir, index_id, config.sparse_model);
             if(!sparse_storage->initialize()) {
                 throw std::runtime_error("Failed to initialize sparse storage");
             }
@@ -646,24 +771,21 @@ public:
             return vs->get_vectors_batch_into(labels, buffers, success, count);
         });
 
-        // Create WAL during index creation
-        getOrCreateWAL(index_id);
+        auto wal = createWAL(index_id);
 
         // Add to indices with minimal lock scope
         {
             std::unique_lock<std::shared_mutex> lock(indices_mutex_);
-            // Emplace directly with constructor arguments to avoid move
-            auto [it, inserted] =
-                    indices_.emplace(std::piecewise_construct,
-                                     std::forward_as_tuple(index_id),
-                                     std::forward_as_tuple(index_id,
-                                                           config.sparse_dim,
-                                                           std::move(alg),
-                                                           id_mapper,
-                                                           vector_storage,
-                                                           std::move(sparse_storage),
-                                                           std::chrono::system_clock::now()));
-            it->second.markUpdated();
+            auto entry = std::make_shared<CacheEntry>(index_id,
+                                                      config.sparse_model,
+                                                      std::move(alg),
+                                                      id_mapper,
+                                                      vector_storage,
+                                                      std::move(sparse_storage),
+                                                      std::move(wal),
+                                                      std::chrono::system_clock::now());
+            auto [it, inserted] = indices_.emplace(index_id, entry);
+            it->second->markDirty();
             indices_list_.push_front(index_id);
         }
 
@@ -671,7 +793,7 @@ public:
         IndexMetadata metadata_entry;
         metadata_entry.name = index_name;
         metadata_entry.dimension = config.dim;
-        metadata_entry.sparse_dim = config.sparse_dim;
+        metadata_entry.sparse_model = config.sparse_model;
         metadata_entry.space_type_str = config.space_type_str;
         metadata_entry.quant_level = config.quant_level;
         metadata_entry.checksum = config.checksum;
@@ -685,7 +807,7 @@ public:
         }
 
         LOG_INFO(2022, index_id, "Saving newly created index");
-        // Index is marked as updated so it needs to be saved immediately for crash recovery
+        // Index is marked dirty so it needs to be saved immediately for crash recovery
         saveIndex(index_id);
         return true;
     }
@@ -711,12 +833,13 @@ public:
             throw std::runtime_error("Required files missing for index: " + index_id);
         }
 
-        // Load metadata to get sparse_dim
+        // Load metadata to get sparse_model
         auto metadata = metadata_manager_->getMetadata(index_id);
-        size_t sparse_dim = 0;
-        if(metadata) {
-            sparse_dim = metadata->sparse_dim;
+        if(!metadata) {
+            throw std::runtime_error("Missing or incompatible index metadata for index: "
+                                     + index_id);
         }
+        const ndd::SparseScoringModel sparse_model = metadata->sparse_model;
 
         // Step 1: Load HNSW index (automatically adjusts cache based on element count and cache
         // percentage)
@@ -733,11 +856,12 @@ public:
         auto vector_storage = std::make_shared<VectorStorage>(
                 index_dir, index_id, alg->getDimension(), alg->getQuantLevel());
 
-        // Initialize Sparse Storage if sparse_dim > 0
+        // Initialize Sparse Storage if sparse_model is enabled
         std::unique_ptr<ndd::SparseVectorStorage> sparse_storage;
-        if(sparse_dim > 0) {
+        if(ndd::sparseModelEnabled(sparse_model)) {
             std::string sparse_storage_dir = index_dir + "/sparse";
-            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(sparse_storage_dir, index_id);
+            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(
+                sparse_storage_dir, index_id, sparse_model);
             if(!sparse_storage->initialize()) {
                 throw std::runtime_error("Failed to initialize sparse storage for index: "
                                          + index_id);
@@ -753,39 +877,39 @@ public:
             return vs->get_vectors_batch_into(labels, buffers, success, count);
         });
 
+        auto wal = createWAL(index_id);
+
         LOG_DEBUG("Loaded index: " << index_id);
         LOG_DEBUG("Created space for index: " << index_id);
 
         // Step 3: Update cache entry so that index becomes available to other threads
-        // Emplace directly with constructor arguments to avoid move
-        auto [it, inserted] =
-                indices_.emplace(std::piecewise_construct,
-                                 std::forward_as_tuple(index_id),
-                                 std::forward_as_tuple(index_id,
-                                                       sparse_dim,
-                                                       std::move(alg),
-                                                       id_mapper,
-                                                       vector_storage,
-                                                       std::move(sparse_storage),
-                                                       std::chrono::system_clock::now()));
+        auto entry = std::make_shared<CacheEntry>(index_id,
+                                                  sparse_model,
+                                                  std::move(alg),
+                                                  id_mapper,
+                                                  vector_storage,
+                                                  std::move(sparse_storage),
+                                                  std::move(wal),
+                                                  std::chrono::system_clock::now());
+        auto [it, inserted] = indices_.emplace(index_id, entry);
         indices_list_.push_front(index_id);
 
         // Handle WAL recovery using the IndexManager's method
-        recoverFromWAL(index_id);
+        recoverFromWAL(*it->second);
     }
 
-    // Reload index: save (if updated), evict from memory, and reload
+    // Reload index: save (if dirty), evict from memory, and reload
     // Cache size is automatically checked and adjusted if < 5% of element count during reload
     bool reload(const std::string& index_id) {
         LOG_INFO(2023, index_id, "Starting reload");
 
         try {
-            // Phase 1: Save index if it was updated
+            // Phase 1: Save index if it is dirty
             {
                 std::shared_lock<std::shared_mutex> lock(indices_mutex_);
                 auto it = indices_.find(index_id);
-                if(it != indices_.end() && it->second.updated) {
-                    LOG_DEBUG("Saving updated index before reload: " << index_id);
+                if(it != indices_.end() && it->second && it->second->is_dirty) {
+                    LOG_INFO(2055, index_id, "Saving dirty index before reload");
                     saveIndex(index_id);
                 }
             }
@@ -800,13 +924,17 @@ public:
                     if(list_it != indices_list_.end()) {
                         indices_list_.erase(list_it);
                     }
+                    it->second->cache_valid = false;
                     indices_.erase(it);
                     LOG_INFO(2024, index_id, "Evicted index from cache");
                 }
             }
 
             // Phase 3: Reload (cache adjustment happens automatically in loadIndex)
-            loadIndex(index_id);
+            {
+                std::unique_lock<std::shared_mutex> lock(indices_mutex_);
+                loadIndex(index_id);
+            }
 
             // Phase 4: Report final state
             {
@@ -817,7 +945,7 @@ public:
                     LOG_INFO(2025,
                                    index_id,
                                    "Reloaded index with "
-                                           << it->second.alg->getElementsCount() << " elements");
+                                           << it->second->alg->getElementsCount() << " elements");
                 }
             }
 
@@ -830,15 +958,17 @@ public:
 
     // Add this new function to reload just the algorithm part while preserving the CacheEntry
     void reloadIndex(const std::string& index_id) {
-
-        auto it = indices_.find(index_id);
-        if(it == indices_.end()) {
-            return;  // Index not in cache
+        std::shared_ptr<CacheEntry> entry;
+        {
+            std::shared_lock<std::shared_mutex> read_lock(indices_mutex_);
+            auto it = indices_.find(index_id);
+            if(it == indices_.end()) {
+                return;  // Index not in cache
+            }
+            entry = it->second;
         }
 
-        CacheEntry& entry = it->second;
-
-        std::string index_dir = data_dir_ + "/" + entry.index_id;
+        std::string index_dir = data_dir_ + "/" + entry->index_id;
         std::string vector_storage_dir = index_dir + "/vectors";
         std::string index_path = vector_storage_dir + "/" + settings::DEFAULT_SUBINDEX + ".idx";
 
@@ -846,26 +976,27 @@ public:
         auto new_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(index_path, 0);
 
         // Set the vector fetcher to use our storage
-        new_alg->setVectorFetcher([vs = entry.vector_storage](ndd::idInt label, uint8_t* buffer) {
+        new_alg->setVectorFetcher([vs = entry->vector_storage](ndd::idInt label, uint8_t* buffer) {
             return vs->get_vector(label, buffer);
         });
 
-        new_alg->setVectorFetcherBatch([vs = entry.vector_storage](const ndd::idInt* labels, uint8_t* buffers, bool* success, size_t count) -> size_t {
+        new_alg->setVectorFetcherBatch([vs = entry->vector_storage](const ndd::idInt* labels, uint8_t* buffers, bool* success, size_t count) -> size_t {
             return vs->get_vectors_batch_into(labels, buffers, success, count);
         });
 
         // Replace the algorithm in the existing entry
-        entry.alg = std::move(new_alg);
+        entry->alg = std::move(new_alg);
     }
 
     template <typename VectorType>
     bool addVectors(const std::string& index_id, const std::vector<VectorType>& vectors) {
         try {
             // Get the index entry (loads if needed, handles all locking)
-            auto& entry = getIndexEntry(index_id);
+            auto entry_ptr = getIndexEntry(index_id);
+            auto& entry = *entry_ptr;
 
             // Use per-index operation mutex to prevent concurrent operations
-            std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+            std::unique_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
 
             // Extract string IDs first
             LOG_DEBUG("Adding " << vectors.size() << " vectors to index " << index_id);
@@ -875,7 +1006,7 @@ public:
             }
 
             // CRITICAL FIX: Pass WAL to create_ids_batch for atomic logging
-            WriteAheadLog* wal = getOrCreateWAL(index_id);
+            WriteAheadLog* wal = getOrCreateWAL(entry);
 
             std::vector<std::string> str_ids;
             str_ids.reserve(vectors.size());
@@ -898,13 +1029,19 @@ public:
             // Handle Sparse Vectors if storage is initialized
             if(entry.sparse_storage) {
                 if constexpr(std::is_same_v<VectorType, ndd::HybridVectorObject>) {
+                    /**
+                     * Forward every hybrid doc, including empty sparse payloads, so the sparse
+                     * storage layer can treat upserts as replacements and clear old sparse state.
+                     */
                     std::vector<std::pair<ndd::idInt, ndd::SparseVector>> sparse_batch;
                     sparse_batch.reserve(vectors.size());
 
                     for(size_t i = 0; i < vectors.size(); ++i) {
                         const auto& vec = vectors[i];
+                        ndd::SparseVector sparse_vec;
                         if(!vec.sparse_ids.empty()) {
-                            // Sort indices and values together
+                            // Sort indices and values together so replacement writes preserve the
+                            // inverted index ordering invariants.
                             std::vector<std::pair<uint32_t, float>> pairs;
                             pairs.reserve(vec.sparse_ids.size());
                             for(size_t k = 0; k < vec.sparse_ids.size(); ++k) {
@@ -914,20 +1051,25 @@ public:
                                 return a.first < b.first;
                             });
 
-                            ndd::SparseVector sparse_vec;
                             sparse_vec.indices.reserve(pairs.size());
                             sparse_vec.values.reserve(pairs.size());
                             for(const auto& p : pairs) {
                                 sparse_vec.indices.push_back(p.first);
                                 sparse_vec.values.push_back(p.second);
                             }
-
-                            sparse_batch.emplace_back(numeric_ids[i].first, std::move(sparse_vec));
                         }
+
+                        sparse_batch.emplace_back(numeric_ids[i].first, std::move(sparse_vec));
                     }
 
                     if(!sparse_batch.empty()) {
-                        entry.sparse_storage->store_vectors_batch(sparse_batch);
+                        if(!entry.sparse_storage->store_vectors_batch(sparse_batch)) {
+                            LOG_ERROR(2053,
+                                      index_id,
+                                      "Failed to update sparse storage for batch size "
+                                              << sparse_batch.size());
+                            return false;
+                        }
                     }
                 }
             }
@@ -963,7 +1105,7 @@ public:
                                 << " pre-quantized vectors in vector storage");
 
             // Add to write ahead log using IndexManager's method
-            logInsertsAndUpdates(index_id, numeric_ids);
+            logInsertsAndUpdates(entry, numeric_ids);
 
             // Add to HNSW index in parallel using pre-quantized data from QuantVectorObject
             size_t available_threads = settings::NUM_PARALLEL_INSERTS;
@@ -1008,7 +1150,7 @@ public:
                 thread.join();
             }
 
-            entry.markUpdated();
+            entry.markDirty();
 
             // Check if we need to save based on WAL entry count after logging
             if(wal->getEntryCount() >= persistence_config_.save_every_n_updates) {
@@ -1025,7 +1167,7 @@ public:
             throw;
         } catch(const std::exception& e) {
             LOG_ERROR(2027, index_id, "Batch insertion failed: " << e.what());
-            return false;
+            throw std::runtime_error(std::string("Batch insertion failed: ") + e.what());
         }
     }
 
@@ -1066,10 +1208,11 @@ public:
         }
 
         // Step 3: Load entry and acquire operation mutex for thread safety
-        auto& entry = getIndexEntry(index_id);
+        auto entry_ptr = getIndexEntry(index_id);
+        auto& entry = *entry_ptr;
 
         // FIX: Use per-index operation mutex to prevent concurrent operations
-        std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+        std::unique_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
 
         auto cursor = entry.vector_storage->getCursor();
 
@@ -1123,8 +1266,8 @@ public:
         LOG_INFO(2033, index_id, "Recovered " << batch.size() << " vectors");
 
         // Step 6: Save index
-        // Mark the index as updated so that it will be saved
-        entry.markUpdated();
+        // Mark the index as dirty so that it will be saved
+        entry.markDirty();
         // FIX: Use internal save to avoid circular lock
         saveIndexInternal(entry);
 
@@ -1135,10 +1278,19 @@ public:
         return true;
     }
 
-    std::optional<ndd::VectorObject> getVector(const std::string& index_id,
-                                               const std::string& str_id) {
+    std::optional<ndd::HybridVectorObject> getVector(const std::string& index_id,
+                                                     const std::string& str_id) {
         try {
-            auto& entry = getIndexEntry(index_id);
+            auto entry_ptr = getIndexEntry(index_id);
+            auto& entry = *entry_ptr;
+
+            /**
+             * XXX: We aren't using reader's lock here to enable reads while
+             * writing.
+             * TODO: check correctness when stressing the system.
+             */
+            // std::shared_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
+
             ndd::idInt numeric_id = entry.id_mapper->get_id(str_id);
             if(numeric_id == 0) {
                 return std::nullopt;
@@ -1147,7 +1299,7 @@ public:
             std::vector<uint8_t> vec_bytes = entry.vector_storage->get_vector(numeric_id);
             ndd::VectorMeta meta = entry.vector_storage->get_meta(numeric_id);
 
-            ndd::VectorObject obj;
+            ndd::HybridVectorObject obj;
             obj.id = meta.id;
             obj.meta = meta.meta;
             obj.filter = meta.filter;
@@ -1161,6 +1313,15 @@ public:
 
             // Add the float data to the msgpack
             obj.vector = {float_data.begin(), float_data.end()};
+
+            if(entry.sparse_storage) {
+                auto sparse_txn = entry.sparse_storage->begin_transaction(true);
+                auto sparse_vec = sparse_txn->get_vector(numeric_id);
+                if(sparse_vec.has_value()) {
+                    obj.sparse_ids = std::move(sparse_vec->indices);
+                    obj.sparse_values = std::move(sparse_vec->values);
+                }
+            }
 
             return obj;
         } catch(const std::exception& e) {
@@ -1194,10 +1355,10 @@ public:
                 }
             }
             // Add the list to write ahead log using IndexManager's method
-            logDeletions(entry.index_id, numeric_ids);
+            logDeletions(entry, numeric_ids);
 
-            // Mark the index as updated
-            entry.markUpdated();
+            // Mark the index as dirty
+            entry.markDirty();
 
             return true;
         } catch(const std::exception& e) {
@@ -1208,10 +1369,11 @@ public:
 
     size_t deleteVectorsByFilter(const std::string& index_id, const nlohmann::json& filter_array) {
         try {
-            auto& entry = getIndexEntry(index_id);
+            auto entry_ptr = getIndexEntry(index_id);
+            auto& entry = *entry_ptr;
 
             // Use per-index operation mutex to prevent concurrent operations
-            std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+            std::unique_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
 
             auto numeric_ids =
                     entry.vector_storage->filter_store_->getIdsMatchingFilter(filter_array);
@@ -1219,7 +1381,7 @@ public:
 
             if(deleteVectorsByIds(entry, numeric_ids)) {
                 // Check if we need to save based on WAL entry count after logging
-                WriteAheadLog* wal = getOrCreateWAL(index_id);
+                WriteAheadLog* wal = getOrCreateWAL(entry);
                 if(wal->getEntryCount() >= persistence_config_.save_every_n_updates) {
                     LOG_DEBUG("Saving index " << index_id << " after " << wal->getEntryCount()
                                               << " updates");
@@ -1242,9 +1404,10 @@ public:
     size_t updateFilters(const std::string& index_id,
                          const std::vector<std::pair<std::string, std::string>>& updates) {
         try {
-            auto& entry = getIndexEntry(index_id);
+            auto entry_ptr = getIndexEntry(index_id);
+            auto& entry = *entry_ptr;
 
-            std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+            std::unique_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
 
             size_t updated_count = 0;
             for(const auto& [str_id, new_filter] : updates) {
@@ -1259,7 +1422,7 @@ public:
             }
 
             if(updated_count > 0) {
-                entry.markUpdated();
+                entry.markDirty();
             }
 
             return updated_count;
@@ -1273,14 +1436,15 @@ public:
     }
 
     // Delete a single vector by string ID - vector data will not be deleted. The meta and filter
-    // will be deleted and the vector will be marked as deleted in HNSW. The id will put in the
+    // will be deleted and the vector will be marked as deleted in HNSW. The id will be put in the
     // deleted_ids in id mapper and will be reused for new vectors
     bool deleteVector(const std::string& index_id, const std::string& str_id) {
         try {
-            auto& entry = getIndexEntry(index_id);
+            auto entry_ptr = getIndexEntry(index_id);
+            auto& entry = *entry_ptr;
 
             // Use per-index operation mutex to prevent concurrent operations
-            std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+            std::unique_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
 
             size_t numeric_id = entry.id_mapper->get_id(str_id);
             if(numeric_id == 0) {
@@ -1290,7 +1454,7 @@ public:
 
             // Check if we need to save based on WAL entry count after logging
             if(result) {
-                WriteAheadLog* wal = getOrCreateWAL(index_id);
+                WriteAheadLog* wal = getOrCreateWAL(entry);
                 if(wal->getEntryCount() >= persistence_config_.save_every_n_updates) {
                     LOG_DEBUG("Saving index " << index_id << " after " << wal->getEntryCount()
                                               << " updates");
@@ -1320,92 +1484,122 @@ public:
 
     std::optional<std::vector<ndd::VectorResult>>
     searchKNN(const std::string& index_id,
-              const std::vector<float>& query,
-              const std::vector<uint32_t>& sparse_indices,
-              const std::vector<float>& sparse_values,
-              size_t k,
-              const nlohmann::json& filter_array,
-              ndd::FilterParams params = {},
-              bool include_vectors = false,
-              size_t ef = 0) {
+                const std::vector<float>& query,
+                const std::vector<uint32_t>& sparse_indices,
+                const std::vector<float>& sparse_values,
+                size_t k,
+                const nlohmann::json& filter_array,
+                ndd::FilterParams params = {},
+                bool include_vectors = false,
+                size_t ef = settings::DEFAULT_EF_SEARCH ,
+                float kDenseRrfWeight = settings::DEFAULT_DENSE_RRF_WEIGHT,
+                float kRrfRankConstant = settings::DEFAULT_RRF_RANK_CONSTANT)
+    {
+        const float kSparseRrfWeight = 1.0f - kDenseRrfWeight;
         try {
-            auto& entry = getIndexEntry(index_id);
+            auto entry_ptr = getIndexEntry(index_id);
+            auto& entry = *entry_ptr;
+
+            /**
+             * XXX: We aren't using reader's lock here to enable reads while
+             * writing.
+             * TODO: check correctness when stressing the system.
+             */
+            // std::shared_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
+
             entry.searchCount += k;
+            const bool run_dense_search = kDenseRrfWeight > 0.0f && !query.empty();
+
+            const bool run_sparse_search =
+                    kSparseRrfWeight > 0.0f && entry.sparse_storage && !sparse_indices.empty();
+
+            // Zero-weight sources cannot influence the final ranking, so skip their retrieval
+            // work entirely.
+            if(!run_dense_search && !run_sparse_search) {
+                return std::vector<ndd::VectorResult>();
+            }
 
             // 0. Compute Filter Bitmap (Shared)
             std::optional<ndd::RoaringBitmap> active_filter_bitmap;
             if (!filter_array.empty()) {
                 active_filter_bitmap = entry.vector_storage->filter_store_->computeFilterBitmap(filter_array);
             }
+            const ndd::RoaringBitmap* filter_ptr =
+                    active_filter_bitmap ? &(*active_filter_bitmap) : nullptr;
 
             // 1. Sparse Search (Async)
             std::future<std::vector<std::pair<ndd::idInt, float>>> sparse_future;
-            if(entry.sparse_storage && !sparse_indices.empty()) {
-                sparse_future = std::async(std::launch::async, [&]() {
+            if(run_sparse_search) {
+                sparse_future = std::async(std::launch::async, [&, filter_ptr]() {
                     ndd::SparseVector sparse_query;
-                    // Sort indices and values together
-                    std::vector<std::pair<uint32_t, float>> pairs;
-                    pairs.reserve(sparse_indices.size());
-                    for(size_t i = 0; i < sparse_indices.size(); ++i) {
-                        pairs.emplace_back(sparse_indices[i], sparse_values[i]);
-                    }
-                    std::sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
-                        return a.first < b.first;
-                    });
 
-                    sparse_query.indices.reserve(pairs.size());
-                    sparse_query.values.reserve(pairs.size());
-                    for(const auto& p : pairs) {
-                        sparse_query.indices.push_back(p.first);
-                        sparse_query.values.push_back(p.second);
+                    // Reuse the caller's ordering when it is already sorted so we do not copy
+                    // the same sparse payload into an extra temporary representation.
+                    if(std::is_sorted(sparse_indices.begin(), sparse_indices.end())) {
+                        sparse_query.indices = sparse_indices;
+                        sparse_query.values = sparse_values;
+                    } else {
+                        std::vector<std::pair<uint32_t, float>> pairs;
+                        pairs.reserve(sparse_indices.size());
+                        for(size_t i = 0; i < sparse_indices.size(); ++i) {
+                            pairs.emplace_back(sparse_indices[i], sparse_values[i]);
+                        }
+                        std::sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
+                            return a.first < b.first;
+                        });
+
+                        sparse_query.indices.resize(pairs.size());
+                        sparse_query.values.resize(pairs.size());
+                        for(size_t i = 0; i < pairs.size(); ++i) {
+                            sparse_query.indices[i] = pairs[i].first;
+                            sparse_query.values[i] = pairs[i].second;
+                        }
                     }
 
-                    const ndd::RoaringBitmap* filter_ptr = active_filter_bitmap.has_value() ? &(*active_filter_bitmap) : nullptr;
                     return entry.sparse_storage->search(sparse_query, k, filter_ptr);
                 });
             }
 
             // 2. Dense Search (Main Thread)
             std::vector<std::pair<float, ndd::idInt>> dense_results;
-
-            if(!query.empty()) {
+            if(run_dense_search) {
                 // Convert query to bytes using the wrapper method
                 ndd::quant::QuantizationLevel quant_level = entry.alg->getQuantLevel();
                 auto space = entry.alg->getSpace();
                 std::vector<uint8_t> query_bytes =
                         ndd::quant::get_quantizer_dispatch(quant_level).quantize(query);
 
-                if (!active_filter_bitmap) {
+                if(!filter_ptr) {
                     dense_results = entry.alg->searchKnn(query_bytes.data(), k, ef);
                 } else {
                     // Smart Filter Execution Strategy
-                    auto& bitmap = *active_filter_bitmap;
+                    const auto& bitmap = *filter_ptr;
                     size_t card = bitmap.cardinality();
 
                     if (card == 0) {
                         // No results match filter
                     } else if (card < params.prefilter_threshold) {
                          // Strategy A: Brute Force on Small Subset
-                         std::vector<ndd::idInt> valid_ids;
-                         valid_ids.reserve(card);
-                         bitmap.iterate([](ndd::idInt id, void* ptr){
-                            static_cast<std::vector<ndd::idInt>*>(ptr)->push_back(id);
-                            return true;
-                         }, &valid_ids);
+                        std::vector<ndd::idInt> valid_ids;
+                        valid_ids.reserve(card);
+                        bitmap.iterate([](ndd::idInt id, void* ptr){
+                        static_cast<std::vector<ndd::idInt>*>(ptr)->push_back(id);
+                        return true;
+                        }, &valid_ids);
 
                          // Fetch vectors
-                         auto vector_batch = entry.vector_storage->get_vectors_batch(valid_ids);
-                         
-                         // Prepare subset for bruteforce search
-                         std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
-                         vector_subset.reserve(vector_batch.size());
-                         for(const auto& [nid, vbytes] : vector_batch) {
-                             vector_subset.emplace_back(nid, vbytes);
-                         }
-                         
-                         dense_results = hnswlib::searchKnnSubset<float>(
-                             query_bytes.data(), vector_subset, k, space);
-                         
+                        auto vector_batch = entry.vector_storage->get_vectors_batch(valid_ids);
+
+                        // Prepare subset for bruteforce search
+                        std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
+                        vector_subset.reserve(vector_batch.size());
+                        for(auto& [nid, vbytes] : vector_batch) {
+                            vector_subset.emplace_back(nid, std::move(vbytes));
+                        }
+
+                        dense_results = hnswlib::searchKnnSubset<float>(
+                            query_bytes.data(), vector_subset, k, space);
+
                     } else {
                         // Strategy B: Filtered HNSW Search
                         BitMapFilterFunctor functor(bitmap);
@@ -1414,9 +1608,17 @@ public:
                         // Try to use optimized templated search if algorithm matches
                         auto* hnsw_alg = dynamic_cast<hnswlib::HierarchicalNSW<float>*>(entry.alg.get());
                         if (hnsw_alg) {
-                             dense_results = hnsw_alg->searchKnn(query_bytes.data(), k, effective_ef, &functor, params.boost_percentage);
+                            dense_results = hnsw_alg->searchKnn(query_bytes.data(),
+                                                                k,
+                                                                effective_ef,
+                                                                &functor,
+                                                                params.boost_percentage);
                         } else {
-                             dense_results = entry.alg->searchKnn(query_bytes.data(), k, effective_ef, &functor, params.boost_percentage);
+                            dense_results = entry.alg->searchKnn(query_bytes.data(),
+                                                                    k,
+                                                                    effective_ef,
+                                                                    &functor,
+                                                                    params.boost_percentage);
                         }
                     }
                 }
@@ -1428,7 +1630,7 @@ public:
                 sparse_results = sparse_future.get();
             }
 
-            // 3. Combine Results
+            // 4. Combine Results
             std::vector<std::pair<float, ndd::idInt>> final_candidates;
 
             if(dense_results.empty() && sparse_results.empty()) {
@@ -1446,17 +1648,30 @@ public:
                     final_candidates.emplace_back(p.second, p.first);
                 }
             } else {
-                // Hybrid results - RRF
+                // Hybrid results - weighted RRF.
                 std::unordered_map<ndd::idInt, float> combined_scores;
-                const float k_rrf = 60.0f;
+                combined_scores.reserve(dense_results.size() + sparse_results.size());
 
-                for(size_t i = 0; i < dense_results.size(); ++i) {
-                    combined_scores[dense_results[i].second] += 1.0f / (k_rrf + i + 1);
-                }
+                // Reuse the dense and sparse result buffers directly so hybrid fusion does not
+                // build another copied view of the same ranked lists.
+                auto add_weighted_rrf_scores = [&](const auto& ranked_results,
+                                                    float weight,
+                                                    auto extract_id){
+                    if(weight <= 0.0f) {
+                        return;
+                    }
 
-                for(size_t i = 0; i < sparse_results.size(); ++i) {
-                    combined_scores[sparse_results[i].first] += 1.0f / (k_rrf + i + 1);
-                }
+                    for(size_t i = 0; i < ranked_results.size(); ++i) {
+                        const ndd::idInt id = extract_id(ranked_results[i]);
+                        combined_scores[id] +=
+                                weight / (kRrfRankConstant + static_cast<float>(i) + 1.0f);
+                    }
+                };
+
+                add_weighted_rrf_scores(
+                        dense_results, kDenseRrfWeight, [](const auto& result) { return result.second; });
+                add_weighted_rrf_scores(
+                        sparse_results, kSparseRrfWeight, [](const auto& result) { return result.first; });
 
                 final_candidates.reserve(combined_scores.size());
                 for(const auto& [id, score] : combined_scores) {
@@ -1464,8 +1679,8 @@ public:
                 }
 
                 std::sort(final_candidates.begin(),
-                          final_candidates.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
+                            final_candidates.end(),
+                            [](const auto& a, const auto& b) { return a.first > b.first; });
             }
 
             std::vector<ndd::VectorResult> results;
@@ -1479,7 +1694,7 @@ public:
                 ndd::VectorMeta meta = entry.vector_storage->get_meta(p.second);
 
                 // Apply filter
-                if(active_filter_bitmap && !active_filter_bitmap->contains(p.second)) {
+                if(filter_ptr && !filter_ptr->contains(p.second)) {
                     continue;
                 }
 
@@ -1498,7 +1713,7 @@ public:
                         std::vector<float> float_data =
                                 ndd::quant::get_quantizer_dispatch(quant_level)
                                         .dequantize(vec_bytes.data(), entry.alg->getDimension());
-                        result.vector = {float_data.begin(), float_data.end()};
+                        result.vector = std::move(float_data);
                     }
                 }
 
@@ -1508,106 +1723,6 @@ public:
                 // Early exit when we have enough results
                 if(filtered_count >= k) {
                     break;
-                }
-            }
-
-            // Fallback logic removed
-            if(false) {
-                size_t filter_cardinality =
-                        entry.vector_storage->filter_store_->countIdsMatchingFilter(filter_array);
-                LOG_DEBUG("Post-filter gave poor results ("
-                          << filtered_count << "/" << k
-                          << "), checking pre-filter option. Cardinality: " << filter_cardinality);
-
-                if(filter_cardinality < params.prefilter_threshold) {
-                    LOG_DEBUG("Using pre-filter approach due to poor post-filter results");
-
-                    // Pre-filter: Get filtered IDs and do bruteforce search
-                    auto filtered_ids =
-                            entry.vector_storage->filter_store_->getIdsMatchingFilter(filter_array);
-                    LOG_DEBUG("Pre-filter: got " << filtered_ids.size() << " filtered IDs");
-
-                    if(!filtered_ids.empty()) {
-                        // Convert size_t to size_t for batch retrieval
-                        std::vector<ndd::idInt> numeric_ids(filtered_ids.begin(),
-                                                            filtered_ids.end());
-
-                        // Get vectors for filtered IDs
-                        auto vector_batch = entry.vector_storage->get_vectors_batch(numeric_ids);
-                        LOG_DEBUG("Pre-filter: retrieved " << vector_batch.size() << " vectors");
-
-                        // Prepare subset for bruteforce search
-                        std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
-                        vector_subset.reserve(vector_batch.size());
-
-                        for(const auto& [numeric_id, vec_bytes] : vector_batch) {
-                            vector_subset.emplace_back(static_cast<idInt>(numeric_id), vec_bytes);
-                        }
-
-                        // Perform bruteforce search on subset using HNSW's space interface
-                        ndd::quant::QuantizationLevel quant_level = entry.alg->getQuantLevel();
-                        auto space = entry.alg->getSpace();
-                        std::vector<uint8_t> query_bytes =
-                                ndd::quant::get_quantizer_dispatch(quant_level).quantize(query);
-                        auto prefilter_results = hnswlib::searchKnnSubset<float>(
-                                query_bytes.data(), vector_subset, k, space);
-
-                        LOG_DEBUG("Pre-filter: bruteforce search returned "
-                                  << prefilter_results.size() << " results");
-
-                        // Convert results to VectorResult format
-                        std::vector<ndd::VectorResult> prefilter_final_results;
-                        prefilter_final_results.reserve(prefilter_results.size());
-
-                        for(const auto& [distance, label] : prefilter_results) {
-                            ndd::idInt numeric_id = static_cast<ndd::idInt>(label);
-                            ndd::VectorMeta meta = entry.vector_storage->get_meta(numeric_id);
-
-                            ndd::VectorResult result;
-                            result.id = meta.id;
-                            result.filter = meta.filter;
-                            result.meta = meta.meta;
-
-                            if(entry.alg->getSpaceType() == hnswlib::COSINE_SPACE
-                               || entry.alg->getSpaceType() == hnswlib::IP_SPACE) {
-                                result.similarity = 1.0f - distance;
-                            } else {
-                                result.similarity = distance;
-                            }
-
-                            result.norm = meta.norm;
-
-                            if(include_vectors) {
-                                // Find the vector bytes from our batch
-                                auto it = std::find_if(vector_batch.begin(),
-                                                       vector_batch.end(),
-                                                       [numeric_id](const auto& pair) {
-                                                           return pair.first == numeric_id;
-                                                       });
-
-                                if(it != vector_batch.end()) {
-                                    const auto& vec_bytes = it->second;
-
-                                    ndd::quant::QuantizationLevel quant_level =
-                                            entry.alg->getQuantLevel();
-                                    std::vector<float> float_data =
-                                            ndd::quant::get_quantizer_dispatch(quant_level)
-                                                    .dequantize(vec_bytes.data(),
-                                                                entry.alg->getDimension());
-                                    result.vector = {float_data.begin(), float_data.end()};
-                                }
-                            }
-
-                            prefilter_final_results.push_back(std::move(result));
-                        }
-
-                        return prefilter_final_results;
-                    }
-                } else {
-                    LOG_DEBUG("Filter cardinality too high for pre-filtering ("
-                              << filter_cardinality
-                              << " >= " << params.prefilter_threshold
-                              << "), returning post-filter results");
                 }
             }
 
@@ -1627,7 +1742,9 @@ public:
         // Remove from in-memory structures if loaded
         auto it = indices_.find(index_id);
         if(it != indices_.end()) {
-            std::lock_guard<std::mutex> operation_lock(it->second.operation_mutex);
+            auto entry = it->second;
+            entry->cache_valid = false;
+            std::unique_lock<std::shared_mutex> operation_lock(entry->operation_mutex);
 
             auto indx_it = std::find(indices_list_.begin(), indices_list_.end(), index_id);
             if(indx_it != indices_list_.end()) {
@@ -1672,24 +1789,59 @@ public:
         return false;
     }
 
+    /**
+     * This function returns the information about a given index.
+     * Currently the implementation is as follows:
+     * 1. If the index is live (listed in IndexManager.indices_), populate
+     * information from there.
+     * 2. Else read the metadata and populate the information from there.
+     *
+     * NOTE: This is a stop-gap solution to make sure that elements_count
+     * is never stale. This should be fixed later with metadata overhaul.  
+     */
     std::optional<IndexInfo> getIndexInfo(const std::string& index_id) {
-        auto& entry = getIndexEntry(index_id);
-        IndexInfo indx = {entry.alg->getElementsCount(),
-                          entry.alg->getDimension(),
-                          entry.sparse_dim,
-                          entry.alg->getSpaceTypeStr(),
-                          entry.alg->getQuantLevel(),
-                          entry.alg->getChecksum(),
-                          entry.alg->getM(),
-                          entry.alg->getEfConstruction()};
-        return indx;
+
+        if(auto entry_ptr = findInMemoryIndexEntry(index_id)) {
+            /**
+             * XXX: We aren't using reader's lock here to enable reads while
+             * writing.
+             * TODO: check correctness when stressing the system.
+             * check other instances of shared_lock on operation_mutex.
+             */
+
+            std::shared_lock<std::shared_mutex> operation_lock(entry_ptr->operation_mutex);
+
+            return std::optional<IndexInfo>{std::in_place,
+                                            entry_ptr->alg->getElementsCount(),
+                                            entry_ptr->alg->getDimension(),
+                                            entry_ptr->sparse_model,
+                                            entry_ptr->alg->getSpaceTypeStr(),
+                                            entry_ptr->alg->getQuantLevel(),
+                                            entry_ptr->alg->getChecksum(),
+                                            entry_ptr->alg->getM(),
+                                            entry_ptr->alg->getEfConstruction()};
+        }
+
+        auto metadata = metadata_manager_->getMetadata(index_id);
+        if(!metadata) {
+            return std::nullopt;
+        }
+
+        return std::optional<IndexInfo>{std::in_place,
+                                        metadata->total_elements,
+                                        metadata->dimension,
+                                        metadata->sparse_model,
+                                        std::move(metadata->space_type_str),
+                                        metadata->quant_level,
+                                        metadata->checksum,
+                                        metadata->M,
+                                        metadata->ef_con};
     }
 
     // Method to log vector additions with both numeric and string IDs
-    void logInsertsAndUpdates(const std::string& index_id,
+    void logInsertsAndUpdates(CacheEntry& entry,
                               const std::vector<std::pair<idInt, bool>>& numeric_ids) {
-
-        WriteAheadLog* wal = getOrCreateWAL(index_id);
+        WriteAheadLog* wal = getOrCreateWAL(entry);
 
         // Create WAL entries for each vector addition
         std::vector<WriteAheadLog::WALEntry> entries;
@@ -1718,8 +1870,8 @@ public:
     }
 
     // Method to log vector deletions (only numeric IDs needed)
-    void logDeletions(const std::string& index_id, const std::vector<idInt>& numeric_ids) {
-        WriteAheadLog* wal = getOrCreateWAL(index_id);
+    void logDeletions(CacheEntry& entry, const std::vector<idInt>& numeric_ids) {
+        WriteAheadLog* wal = getOrCreateWAL(entry);
 
         // Create WAL entries for each vector deletion
         std::vector<WriteAheadLog::WALEntry> entries;
@@ -1751,7 +1903,7 @@ public:
                                                 const std::string& username);
 
     // Forwarding methods (no IndexManager internals needed)
-    std::vector<std::string> listBackups(const std::string& username) {
+    nlohmann::json listBackups(const std::string& username) {
         return backup_store_.listBackups(username);
     }
 
@@ -1760,7 +1912,7 @@ public:
         return backup_store_.deleteBackup(backup_name, username);
     }
 
-    std::optional<ActiveBackup> getActiveBackup(const std::string& username) {
+    std::optional<std::pair<std::string, std::string>> getActiveBackup(const std::string& username) {
         return backup_store_.getActiveBackup(username);
     }
 
@@ -1776,7 +1928,8 @@ public:
 
 // ========== IndexManager backup implementations ==========
 
-inline void IndexManager::executeBackupJob(const std::string& index_id, const std::string& backup_name) {
+inline void IndexManager::executeBackupJob(const std::string& index_id, const std::string& backup_name,
+                                            std::stop_token st) {
     std::string username;
     size_t upos = index_id.find('/');
     if (upos != std::string::npos) {
@@ -1825,7 +1978,8 @@ inline void IndexManager::executeBackupJob(const std::string& index_id, const st
             metadata_json["params"] = {{"M", meta->M},
                            {"ef_construction", meta->ef_con},
                            {"dim", meta->dimension},
-                           {"sparse_dim", meta->sparse_dim},
+                           {"sparse_model",
+                            ndd::sparseScoringModelToString(meta->sparse_model)},
                            {"space_type", meta->space_type_str},
                            {"quant_level", static_cast<int>(meta->quant_level)},
                            {"total_elements", meta->total_elements},
@@ -1836,10 +1990,33 @@ inline void IndexManager::executeBackupJob(const std::string& index_id, const st
             throw std::runtime_error("Cannot create backup without index metadata");
         }
 
-        auto& entry = getIndexEntry(index_id);
+        // Check stop_token before expensive operations
+        if (st.stop_requested()) {
+            LOG_INFO(2056, index_id, "Backup cancelled before backup work started");
+            backup_store_.clearActiveBackup(username);
+            return;
+        }
+
+        auto entry_ptr = getIndexEntry(index_id);
+        auto& entry = *entry_ptr;
         std::string metadata_file_in_index = source_dir + "/metadata.json";
         {
-            std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+            /**
+             * NOTE: While making a backup is a reading operation on the index,
+             * we are picking a writer's lock here because we have disabled reader's
+             * locks on other instances of read in the system right now.
+             *
+             * This is to enable reads while writes are happening on the index.
+             * Check other instances of shared_lock on operation_mutex.
+             */
+            std::unique_lock<std::shared_mutex> operation_lock(entry.operation_mutex);
+
+            // Check again after acquiring lock (shutdown may have been requested while waiting)
+            if (st.stop_requested()) {
+                LOG_INFO(2057, index_id, "Backup cancelled");
+                backup_store_.clearActiveBackup(username);
+                return;
+            }
 
             saveIndexInternal(entry);
 
@@ -1860,7 +2037,7 @@ inline void IndexManager::executeBackupJob(const std::string& index_id, const st
 
             std::string error_msg;
             LOG_DEBUG("Creating tar archive from " << source_dir << " to " << backup_tar_temp);
-            if(!backup_store_.createBackupTar(source_dir, backup_tar_temp, error_msg)) {
+            if(!backup_store_.createBackupTar(source_dir, backup_tar_temp, error_msg, st)) {
                 if(std::filesystem::exists(metadata_file_in_index)) {
                     std::filesystem::remove(metadata_file_in_index);
                 }
@@ -1975,12 +2152,14 @@ inline std::pair<bool, std::string> IndexManager::restoreBackup(const std::strin
         IndexMetadata new_meta;
         new_meta.name = target_index_name;
         new_meta.dimension = meta_json["params"]["dim"];
-        new_meta.sparse_dim = meta_json["params"].value("sparse_dim", 0ul);
         new_meta.M = meta_json["params"]["M"];
         new_meta.ef_con = meta_json["params"]["ef_construction"];
         new_meta.space_type_str = meta_json["params"]["space_type"];
         new_meta.quant_level = static_cast<ndd::quant::QuantizationLevel>(
                 meta_json["params"]["quant_level"].get<int>());
+        const auto sparse_model = ndd::sparseScoringModelFromString(
+                meta_json["params"]["sparse_model"].get<std::string>());
+        new_meta.sparse_model = *sparse_model;
         new_meta.created_at = std::chrono::system_clock::now();
         new_meta.total_elements = meta_json["params"].value("total_elements", 0ul);
         new_meta.checksum = meta_json["params"].value("checksum", -1);
@@ -1989,7 +2168,10 @@ inline std::pair<bool, std::string> IndexManager::restoreBackup(const std::strin
 
         std::filesystem::remove_all(backup_extract_dir);
 
-        loadIndex(target_index_id);
+        {
+            std::unique_lock<std::shared_mutex> write_lock(indices_mutex_);
+            loadIndex(target_index_id);
+        }
 
         LOG_INFO(2045, username, target_index_name, "Restored backup from " << backup_tar);
         return {true, ""};
@@ -2025,12 +2207,10 @@ inline std::pair<bool, std::string> IndexManager::createBackupAsync(const std::s
         return {false, "Backup already exists: " + backup_name};
     }
 
-    auto& entry = getIndexEntry(index_id);
-    backup_store_.setActiveBackup(username, index_id, backup_name);
-
-    std::thread([this, index_id, backup_name]() {
-        executeBackupJob(index_id, backup_name);
-    }).detach();
+    std::jthread t([this, index_id, backup_name](std::stop_token st) {
+        executeBackupJob(index_id, backup_name, st);
+    });
+    backup_store_.setActiveBackup(username, index_id, backup_name, std::move(t));
 
     LOG_INFO(2046, index_id, "Backup started: " << backup_name);
 

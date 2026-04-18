@@ -32,12 +32,12 @@
 // local includes
 #include "settings.hpp"
 #include "mdbx/mdbx.h"
+#include "json/nlohmann_json.hpp"
 #include "sparse/inverted_index.hpp"
 #include "core/ndd.hpp"
 #include "auth.hpp"
 #include "quant/common.hpp"
-#include "cpu_compat_check/check_avx_compat.hpp"
-#include "cpu_compat_check/check_arm_compat.hpp"
+#include "system_sanity/system_sanity.hpp"
 
 using ndd::quant::quantLevelToString;
 using ndd::quant::stringToQuantLevel;
@@ -104,30 +104,41 @@ json_error_500(const std::string& username, const std::string& path, const std::
     return json_error_500(username, "-", path, message);
 }
 
-/**
- * Checks if the CPU is compatible with all
- * the instruction sets being used for x86, ARM and MAC Mxx
- */
-bool is_cpu_compatible() {
-    bool ret = true;
+inline crow::response json_response(const nlohmann::ordered_json& payload, int code = 200) {
+    crow::response res(code);
+    res.set_header("Content-Type", "application/json");
+    res.body = payload.dump();
+    return res;
+}
 
-#if defined(USE_AVX2) && (defined(__x86_64__) || defined(_M_X64))
-    ret &= is_avx2_compatible();
-#endif  //AVX2 checks
+inline nlohmann::ordered_json make_index_list_item(const std::string& index_name,
+                                                   const IndexMetadata& metadata) {
+    nlohmann::ordered_json item = nlohmann::ordered_json::object();
+    item["name"] = index_name;
+    item["total_elements"] = static_cast<int64_t>(metadata.total_elements);
+    item["dimension"] = static_cast<int64_t>(metadata.dimension);
+    item["sparse_model"] = ndd::sparseScoringModelToString(metadata.sparse_model);
+    item["space_type"] = metadata.space_type_str;
+    item["precision"] = quantLevelToString(metadata.quant_level);
+    item["checksum"] = metadata.checksum;
+    item["M"] = static_cast<int64_t>(metadata.M);
+    item["created_at"] =
+            static_cast<int64_t>(std::chrono::system_clock::to_time_t(metadata.created_at));
+    return item;
+}
 
-#if defined(USE_AVX512) && (defined(__x86_64__) || defined(_M_X64))
-    ret &= is_avx512_compatible();
-#endif  //AVX512 checks
-
-#if defined(USE_NEON)
-    ret &= is_neon_compatible();
-#endif
-
-#if defined(USE_SVE2)
-    ret &= is_sve2_compatible();
-#endif
-
-    return ret;
+inline nlohmann::ordered_json make_index_info_payload(const IndexInfo& info) {
+    nlohmann::ordered_json payload = nlohmann::ordered_json::object();
+    payload["total_elements"] = static_cast<int64_t>(info.total_elements);
+    payload["dimension"] = static_cast<int64_t>(info.dimension);
+    payload["sparse_model"] = ndd::sparseScoringModelToString(info.sparse_model);
+    payload["space_type"] = info.space_type_str;
+    payload["precision"] = quantLevelToString(info.quant_level);
+    payload["checksum"] = info.checksum;
+    payload["M"] = static_cast<int64_t>(info.M);
+    payload["ef_con"] = static_cast<int64_t>(info.ef_con);
+    payload["lib_token"] = settings::DEFAULT_LIB_TOKEN;
+    return payload;
 }
 
 // Read file contents
@@ -189,27 +200,33 @@ bool file_exists(const std::string& path) {
 
 int main(int argc, char** argv) {
 
-    if(!is_cpu_compatible()) {
-        LOG_ERROR(1004, "CPU is not compatible; server startup aborted");
-        return 0;
+    const std::string settings_error = settings::validateSettings();
+    if(!settings_error.empty()) {
+        LOG_ERROR(1065, "Server startup aborted: " << settings_error);
+        return 1;
     }
+
+    if(!run_startup_sanity_checks()) {
+        LOG_ERROR(1799, "Server startup aborted due to failed sanity checks");
+        return 1;
+    }
+
     LOG_INFO("SERVER_ID: " << settings::SERVER_ID);
     LOG_INFO("SERVER_PORT: " << settings::SERVER_PORT);
     LOG_INFO("DATA_DIR: " << settings::DATA_DIR);
     LOG_INFO("NUM_PARALLEL_INSERTS: " << settings::NUM_PARALLEL_INSERTS);
     LOG_INFO("NUM_RECOVERY_THREADS: " << settings::NUM_RECOVERY_THREADS);
-    LOG_INFO("MAX_MEMORY_GB: " << settings::MAX_MEMORY_GB);
     LOG_INFO("ENABLE_DEBUG_LOG: " << settings::ENABLE_DEBUG_LOG);
     LOG_INFO("AUTH_TOKEN: " << settings::AUTH_TOKEN);
     LOG_INFO("AUTH_ENABLED: " << settings::AUTH_ENABLED);
     LOG_INFO("DEFAULT_USERNAME: " << settings::DEFAULT_USERNAME);
     LOG_INFO("DEFAULT_SERVER_TYPE: " << settings::DEFAULT_SERVER_TYPE);
     LOG_INFO("DEFAULT_DATA_DIR: " << settings::DEFAULT_DATA_DIR);
-    LOG_INFO("DEFAULT_MAX_ACTIVE_INDICES: " << settings::DEFAULT_MAX_ACTIVE_INDICES);
     LOG_INFO("DEFAULT_MAX_ELEMENTS: " << settings::DEFAULT_MAX_ELEMENTS);
     LOG_INFO("DEFAULT_MAX_ELEMENTS_INCREMENT: " << settings::DEFAULT_MAX_ELEMENTS_INCREMENT);
     LOG_INFO("DEFAULT_MAX_ELEMENTS_INCREMENT_TRIGGER: "
-              << settings::DEFAULT_MAX_ELEMENTS_INCREMENT_TRIGGER);
+                << settings::DEFAULT_MAX_ELEMENTS_INCREMENT_TRIGGER);
+    LOG_INFO("MINIMUM_REQUIRED_DRAM_MB: " << settings::MINIMUM_REQUIRED_DRAM_MB);
 
     // Path to React build directory
     // Get the executable's directory and resolve frontend/dist relative to it
@@ -220,7 +237,6 @@ int main(int argc, char** argv) {
 
     // Initialize index manager with persistence config
     std::string data_dir = settings::DATA_DIR;
-    std::filesystem::create_directories(data_dir);
 
     PersistenceConfig persistence_config{
             settings::SAVE_EVERY_N_UPDATES,                        // Save every n updates
@@ -231,7 +247,7 @@ int main(int argc, char** argv) {
     LOG_INFO(1005, "Starting the server");
     AuthManager auth_manager(data_dir);
     LOG_INFO(1006, "Created auth manager");
-    IndexManager index_manager(settings::MAX_ACTIVE_INDICES, data_dir, persistence_config);
+    IndexManager index_manager(data_dir, persistence_config);
     LOG_INFO(1007, "Created index manager");
 
     // Initialize the app
@@ -239,10 +255,11 @@ int main(int argc, char** argv) {
 
     // ========== GENERAL ==========
     // Health check endpoint (no auth required)
-    CROW_ROUTE(app, "/api/v1/health").methods("GET"_method)([](const crow::request& req) {
+    // CROW_ROUTE(app, "/api/v1/health").methods("GET"_method)([](const crow::request& req) {
+    CROW_ROUTE(app, "/api/v1/health").methods("GET"_method)([]() {
         crow::json::wvalue response(
                 {{"status", "ok"},
-                 {"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}});
+                {"timestamp", (std::int64_t)std::chrono::system_clock::now().time_since_epoch().count()}});
         PRINT_LOG_TIME();
         ndd::printSparseSearchDebugStats();
         ndd::printSparseUpdateDebugStats();
@@ -393,10 +410,28 @@ int main(int argc, char** argv) {
                     LOG_INFO(1018, index_id, "Creating index with custom size: " << size_in_millions << "M vectors");
                 }
 
-                size_t sparse_dim = body.has("sparse_dim") ? (size_t)body["sparse_dim"].i() : 0;
+                if(body.has("sparse_dim")) {
+                    LOG_WARN(1019,
+                             index_id,
+                             "Create-index request used legacy sparse fields");
+                    return json_error(
+                        400,
+                        "Legacy sparse fields are not supported. Use sparse_model with one of: "
+                        "None, default, endee_bm25");
+                }
+
+                const std::string sparse_model_str =
+                        body.has("sparse_model") ? std::string(body["sparse_model"].s()) : "None";
+                const auto sparse_model = ndd::sparseScoringModelFromString(sparse_model_str);
+                if(!sparse_model.has_value()) {
+                    LOG_WARN(1025, index_id, "Invalid sparse_model: " << sparse_model_str);
+                    return json_error(
+                        400,
+                        "Invalid sparse_model. Must be one of: None, default, endee_bm25");
+                }
 
                 IndexConfig config{dim,
-                                   sparse_dim,
+                                   *sparse_model,
                                    settings::MAX_ELEMENTS,  // max elements
                                    body["space_type"].s(),
                                    m,
@@ -409,7 +444,7 @@ int main(int argc, char** argv) {
                     index_manager.createIndex(index_id, config, UserType::Admin, size_in_millions);
                     return crow::response(200, "Index created successfully");
                 } catch(const std::runtime_error& e) {
-                    LOG_WARN(1019, index_id, "Create-index request failed: " << e.what());
+                    LOG_WARN(1026, index_id, "Create-index request failed: " << e.what());
                     return json_error(409, e.what());
                 } catch(const std::exception& e) {
                     return json_error_500(
@@ -549,7 +584,7 @@ int main(int argc, char** argv) {
                 }
             });
 
-    // upload Backup
+    // Upload Backup
     CROW_ROUTE(app, "/api/v1/backups/upload")
             .CROW_MIDDLEWARES(app, AuthMiddleware)
             .methods("POST"_method)([&index_manager, &app](const crow::request& req) {
@@ -645,8 +680,8 @@ int main(int argc, char** argv) {
                     crow::json::wvalue response;
                     if (active) {
                         response["active"] = true;
-                        response["backup_name"] = active->backup_name;
-                        response["index_id"] = active->index_id;
+                        response["backup_name"] = active->second;
+                        response["index_id"] = active->first;
                     } else {
                         response["active"] = false;
                     }
@@ -688,26 +723,14 @@ int main(int argc, char** argv) {
                 auto indexes_with_metadata = index_manager.listUserIndexes(ctx.username);
 
                 // Build a detailed response with array of index objects
-                std::vector<crow::json::wvalue> index_list;
+                nlohmann::ordered_json index_list = nlohmann::ordered_json::array();
                 for(const auto& [index_name, metadata] : indexes_with_metadata) {
-                    crow::json::wvalue index_info(
-                            {{"name", index_name},
-                             {"dimension", static_cast<int64_t>(metadata.dimension)},
-                             {"sparse_dim", static_cast<int64_t>(metadata.sparse_dim)},
-                             {"space_type", metadata.space_type_str},
-                             {"precision", quantLevelToString(metadata.quant_level)},
-                             {"total_elements", static_cast<int64_t>(metadata.total_elements)},
-                             {"checksum", metadata.checksum},
-                             {"M", static_cast<int64_t>(metadata.M)},
-                             {"created_at",
-                              static_cast<int64_t>(
-                                      std::chrono::system_clock::to_time_t(metadata.created_at))}});
-                    index_list.push_back(std::move(index_info));
+                    index_list.push_back(make_index_list_item(index_name, metadata));
                 }
 
-                crow::json::wvalue response;
+                nlohmann::ordered_json response = nlohmann::ordered_json::object();
                 response["indexes"] = std::move(index_list);
-                return crow::response(200, response.dump());
+                return json_response(response);
             });
 
     // Delete index
@@ -796,7 +819,7 @@ int main(int argc, char** argv) {
                                       "k must be between " + std::to_string(settings::MIN_K)
                                               + " and " + std::to_string(settings::MAX_K));
                 }
-                size_t ef = body.has("ef") ? (size_t)body["ef"].i() : 0;
+                size_t ef = body.has("ef") ? (size_t)body["ef"].i() : settings::DEFAULT_EF_SEARCH;
                 bool include_vectors =
                         body.has("include_vectors") ? body["include_vectors"].b() : false;
                 nlohmann::json filter_array = nlohmann::json::array();  // default: empty filter
@@ -830,6 +853,14 @@ int main(int argc, char** argv) {
                      }
                 }
 
+                float dense_rrf_weight = body.has("dense_rrf_weight") ? (float)body["dense_rrf_weight"].d() : settings::DEFAULT_DENSE_RRF_WEIGHT;
+                if (dense_rrf_weight < 0.0f || dense_rrf_weight > 1.0f) {
+                    return json_error(400, "dense_rrf_weight must be between 0 and 1");
+                }
+                float rrf_rank_constant = body.has("rrf_rank_constant") ? (float)body["rrf_rank_constant"].d() : settings::DEFAULT_RRF_RANK_CONSTANT;
+                if(rrf_rank_constant<=0.0f){
+                    return json_error(400, "rrf_rank_constant must be greater than 0");
+                }
                 LOG_DEBUG("Filter: " << filter_array.dump());
                 try {
                     auto search_response = index_manager.searchKNN(index_id,
@@ -840,7 +871,9 @@ int main(int argc, char** argv) {
                                                                     filter_array,
                                                                     filter_params,
                                                                     include_vectors,
-                                                                    ef);
+                                                                    ef,
+                                                                    dense_rrf_weight,
+                                                                    rrf_rank_constant);
 
                     if(!search_response) {
                         LOG_WARN(1038, ctx.username, index_name, "Search request returned no results because the index is missing or search failed");
@@ -876,6 +909,10 @@ int main(int argc, char** argv) {
 
                 // Verify content type is application/msgpack or application/json
                 auto content_type = req.get_header_value("Content-Type");
+
+                if(is_disk_full()){
+                    return json_error(400, "Batch insertion aborted: Not enough storage space");
+                }
 
                 if(content_type == "application/json") {
                     auto body = crow::json::load(req.body);
@@ -940,7 +977,14 @@ int main(int argc, char** argv) {
 
                     try {
                         bool success = index_manager.addVectors(index_id, vectors);
-                        return crow::response(success ? 200 : 400);
+                        if(!success) {
+                            LOG_WARN(1066,
+                                     ctx.username,
+                                     index_name,
+                                     "Insert request failed without detailed error from addVectors");
+                            return json_error(400, "Batch insertion failed");
+                        }
+                        return crow::response(200);
                     } catch(const std::runtime_error& e) {
                         LOG_WARN(1041, ctx.username, index_name, "Insert request rejected: " << e.what());
                         return json_error(400, e.what());
@@ -958,13 +1002,27 @@ int main(int argc, char** argv) {
                             auto vectors = obj.as<std::vector<ndd::HybridVectorObject>>();
                             LOG_DEBUG("Batch size (Hybrid): " << vectors.size());
                             bool success = index_manager.addVectors(index_id, vectors);
-                            return crow::response(success ? 200 : 400);
+                            if(!success) {
+                                LOG_WARN(1067,
+                                         ctx.username,
+                                         index_name,
+                                         "Insert request failed without detailed error from addVectors");
+                                return json_error(400, "Batch insertion failed");
+                            }
+                            return crow::response(200);
                         } catch(...) {
                             // Fallback to VectorObject
                             auto vectors = obj.as<std::vector<ndd::VectorObject>>();
                             LOG_DEBUG("Batch size (Dense): " << vectors.size());
                             bool success = index_manager.addVectors(index_id, vectors);
-                            return crow::response(success ? 200 : 400);
+                            if(!success) {
+                                LOG_WARN(1068,
+                                         ctx.username,
+                                         index_name,
+                                         "Insert request failed without detailed error from addVectors");
+                                return json_error(400, "Batch insertion failed");
+                            }
+                            return crow::response(200);
                         }
                     } catch(const std::runtime_error& e) {
                         LOG_WARN(1042, ctx.username, index_name, "Insert request rejected: " << e.what());
@@ -1001,7 +1059,7 @@ int main(int argc, char** argv) {
                                 LOG_WARN(1045, ctx.username, index_name, "Get-vector request for missing vector id " << vector_id);
                                 return json_error(404, "Vector with the given ID does not exist");
                             }
-                            // Serialize vector as MsgPack
+                            // Serialize hybrid vector as MsgPack
                             msgpack::sbuffer sbuf;
                             msgpack::pack(sbuf, vector.value());
                             // Return as MessagePack
@@ -1151,17 +1209,7 @@ int main(int argc, char** argv) {
                         LOG_WARN(1055, ctx.username, index_name, "Index-info request for missing index");
                         return json_error(404, "Index does not exist");
                     }
-                    crow::json::wvalue response(
-                            {{"total_elements", static_cast<int64_t>(info->total_elements)},
-                             {"dimension", static_cast<int64_t>(info->dimension)},
-                             {"sparse_dim", static_cast<int64_t>(info->sparse_dim)},
-                             {"space_type", info->space_type_str},
-                             {"precision", quantLevelToString(info->quant_level)},
-                             {"checksum", info->checksum},
-                             {"M", static_cast<int64_t>(info->M)},
-                             {"ef_con", static_cast<int64_t>(info->ef_con)},
-                             {"lib_token", settings::DEFAULT_LIB_TOKEN}});
-                    return crow::response(200, response.dump());
+                    return json_response(make_index_info_payload(*info));
                 } catch(const std::runtime_error& e) {
                     LOG_WARN(1056, ctx.username, index_name, "Index-info request failed: " << e.what());
                     return json_error(404, std::string("Error: ") + e.what());

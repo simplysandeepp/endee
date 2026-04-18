@@ -267,8 +267,15 @@ namespace ndd {
     void printSparseUpdateDebugStats() {}
 #endif // ND_SPARSE_INSTRUMENT
 
-    InvertedIndex::InvertedIndex(MDBX_env* env, size_t vocab_size, const std::string& index_id)
-        : env_(env), blocked_term_postings_dbi_(0), vocab_size_(vocab_size), index_id_(index_id) {}
+    InvertedIndex::InvertedIndex(MDBX_env* env,
+                                 size_t vocab_size,
+                                 const std::string& index_id,
+                                 ndd::SparseScoringModel sparse_model)
+        : env_(env),
+          blocked_term_postings_dbi_(0),
+          vocab_size_(vocab_size),
+          index_id_(index_id),
+          sparse_model_(sparse_model) {}
 
     void InvertedIndex::applyHeaderDelta(PostingListHeader& header,
                                         int64_t total_delta,
@@ -394,6 +401,45 @@ namespace ndd {
         return vocab_size_;
     }
 
+    std::vector<std::pair<ndd::idInt, float>>
+    InvertedIndex::search(const SparseVector& query,
+                        size_t k,
+                        const ndd::RoaringBitmap* filter)
+    {
+        return search(query, k, 0, filter);
+    }
+
+    //log(1 + (N - df + 0.5)/(df + 0.5))
+    float InvertedIndex::get_IDF(size_t total_nr_docs, size_t nr_live_docs_with_term) {
+        if (total_nr_docs == 0) {
+            return 0.0f;
+        }
+
+        const size_t clamped_df = std::min(total_nr_docs, nr_live_docs_with_term);
+        const double total_docs = static_cast<double>(total_nr_docs);
+        const double doc_freq = static_cast<double>(clamped_df);
+        const double ratio = (total_docs - doc_freq + 0.5) / (doc_freq + 0.5);
+        return static_cast<float>(std::log(1.0 + ratio));
+    }
+
+#if 0
+    /**
+     * There are many implementations of IDF.
+     * We can make a library of implementations later.
+     */
+    float InvertedIndex::get_IDF(size_t total_nr_docs, size_t nr_live_docs_with_term) {
+        return 1;
+        if (total_nr_docs == 0) {
+            return 0.0f;
+        }
+
+        const size_t clamped_df = std::min(total_nr_docs, nr_live_docs_with_term);
+        const double total_docs = static_cast<double>(total_nr_docs);
+
+        return std::log(total_docs + 1) - std::log(clamped_df + 0.5);
+    }
+#endif //if 0
+
     template <bool StoreFloats>
     bool InvertedIndex::accumulateBatchScores(PostingListIterator* it,
                                                 ndd::idInt batch_start,
@@ -468,6 +514,7 @@ namespace ndd {
     std::vector<std::pair<ndd::idInt, float>>
     InvertedIndex::search(const SparseVector& query,
                         size_t k,
+                        size_t total_nr_docs,
                         const ndd::RoaringBitmap* filter)
     {
         std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -517,6 +564,11 @@ namespace ndd {
                 continue;
             }
 
+            float term_weight = qw;
+            if (sparse_model_ == ndd::SparseScoringModel::ENDEE_BM25) {
+                term_weight *= get_IDF(total_nr_docs, header.nr_live_entries);
+            }
+
             MDBX_cursor* cursor = nullptr;
             rc = mdbx_cursor_open(txn, blocked_term_postings_dbi_, &cursor);
             if (rc != MDBX_SUCCESS) {
@@ -530,7 +582,7 @@ namespace ndd {
             PostingListIterator it;
             it.init(cursor,
                     term_id,
-                    qw,
+                    term_weight,
                     info_it->second,
                     header.nr_entries,
                     this);
@@ -1471,6 +1523,27 @@ namespace ndd {
 
                 size_t ei = 0;
                 size_t bi = 0;
+
+                /**
+                 * Checks if the incoming block updates have any weights
+                 * that are 0s or negatives.
+                 */
+                for (size_t i = 0; i < block_updates.size(); i++) {
+                    const float update_value = block_updates[i].second;
+                    if (update_value == 0.0f) {
+                        LOG_WARN(2227,
+                                 index_id_,
+                                 "addDocumentsBatch received zero value for term "
+                                         << term_id << "; entry will be treated as deleted");
+                    } else if (update_value < 0.0f) {
+                        LOG_WARN(2228,
+                                 index_id_,
+                                 "addDocumentsBatch received negative value " << update_value
+                                                                              << " for term " << term_id
+                                                                              << "; treating as dead");
+                    }
+                }
+
                 while (ei < existing.size() && bi < block_updates.size()) {
                     ndd::idInt existing_id = existing[ei].doc_id;
                     ndd::idInt update_id = block_updates[bi].first;
@@ -1503,17 +1576,6 @@ namespace ndd {
                     if (e.value > 0.0f) {
                         new_live_in_block++;
                         if (e.value > new_block_max) new_block_max = e.value;
-                    } else if (e.value == 0.0f) {
-                        LOG_WARN(2227,
-                                 index_id_,
-                                 "addDocumentsBatch received zero value for term "
-                                         << term_id << "; entry will be treated as deleted");
-                    } else {
-                        LOG_WARN(2228,
-                                 index_id_,
-                                 "addDocumentsBatch received negative value " << e.value
-                                                                              << " for term " << term_id
-                                                                              << "; treating as dead");
                     }
                 }
 

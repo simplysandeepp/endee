@@ -28,7 +28,7 @@ private:
     void init_environment() {
         int rc = mdbx_env_create(&env_);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to create LMDB env");
+            throw std::runtime_error(std::string("Failed to create LMDB env: ") + mdbx_strerror(rc));
         }
 
         // Set geometry for auto-grow using the vector map size settings
@@ -40,7 +40,7 @@ private:
                                    -1,   // shrink threshold (use default)
                                    -1);  // pagesize (use default)
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to set geometry");
+            throw std::runtime_error(std::string("Failed to set geometry: ") + mdbx_strerror(rc));
         }
 
         mdbx_env_set_maxdbs(env_, settings::MAX_NR_SUBINDEX);
@@ -48,19 +48,21 @@ private:
         rc = mdbx_env_open(
                 env_, path_.c_str(), MDBX_WRITEMAP | MDBX_MAPASYNC | MDBX_NORDAHEAD, 0664);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to open environment");
+            // throw std::runtime_error("Failed to open environment");
+            throw std::runtime_error(std::string("Failed to open environment: ") + mdbx_strerror(rc));
+
         }
 
         MDBX_txn* txn;
         rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         rc = mdbx_dbi_open(txn, settings::DEFAULT_SUBINDEX.c_str(), MDBX_CREATE | MDBX_INTEGERKEY, &dbi_);
         if(rc != MDBX_SUCCESS) {
             mdbx_txn_abort(txn);
-            throw std::runtime_error("Failed to open database");
+            throw std::runtime_error(std::string("Failed to open database: ") + mdbx_strerror(rc));
         }
 
         rc = mdbx_txn_commit(txn);
@@ -99,12 +101,14 @@ public:
 
         Cursor(MDBX_env* env, MDBX_dbi dbi, const std::string& index_id) :
             index_id_(index_id) {
-            if(mdbx_txn_begin(env, nullptr, MDBX_TXN_RDONLY, &txn) != MDBX_SUCCESS) {
-                throw std::runtime_error("LMDB txn begin failed");
+            int rc = mdbx_txn_begin(env, nullptr, MDBX_TXN_RDONLY, &txn);
+            if(rc != MDBX_SUCCESS) {
+                throw std::runtime_error(std::string("LMDB txn begin failed: ") + mdbx_strerror(rc));
             }
 
-            if(mdbx_cursor_open(txn, dbi, &cursor) != MDBX_SUCCESS) {
-                throw std::runtime_error("LMDB cursor open failed");
+            rc = mdbx_cursor_open(txn, dbi, &cursor);
+            if(rc != MDBX_SUCCESS) {
+                throw std::runtime_error(std::string("LMDB cursor open failed: ") + mdbx_strerror(rc));
             }
         }
 
@@ -157,7 +161,7 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         try {
@@ -276,6 +280,9 @@ public:
                 MDBX_val data{const_cast<uint8_t*>(vector_bytes.data()), vector_bytes.size()};
 
                 int rc = mdbx_put(txn, dbi_, &key, &data, MDBX_UPSERT);
+                if(rc != MDBX_SUCCESS) {
+                    return rc;
+                }
             }
             return MDBX_SUCCESS;
         };
@@ -283,14 +290,14 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         rc = write_batch(txn);
         // MDBX auto-grows, no manual resize needed
         if(rc != MDBX_SUCCESS) {
             mdbx_txn_abort(txn);
-            throw std::runtime_error("Failed to store vector");
+            throw std::runtime_error(std::string("Failed to store vector: ") + mdbx_strerror(rc));
         }
 
         try_commit(txn);
@@ -308,7 +315,7 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         try {
@@ -336,7 +343,7 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         try {
@@ -344,12 +351,12 @@ public:
 
             rc = mdbx_del(txn, dbi_, &key, nullptr);
             if(rc != MDBX_SUCCESS && rc != MDBX_NOTFOUND) {
-                throw std::runtime_error("Failed to delete vector data");
+                throw std::runtime_error(std::string("Failed to delete vector data: ") + mdbx_strerror(rc));
             }
 
             rc = mdbx_txn_commit(txn);
             if(rc != MDBX_SUCCESS) {
-                throw std::runtime_error("Failed to commit vector deletion");
+                throw std::runtime_error(std::string("Failed to commit vector deletion: ") + mdbx_strerror(rc));
             }
         } catch(...) {
             mdbx_txn_abort(txn);
@@ -376,7 +383,7 @@ private:
     void init_environment() {
         int rc = mdbx_env_create(&env_);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to create LMDB env");
+            throw std::runtime_error(std::string("Failed to create LMDB env: ") + mdbx_strerror(rc));
         }
 
         // Set geometry for auto-grow
@@ -389,7 +396,7 @@ private:
                 -1,                                            // shrink threshold (use default)
                 -1);                                           // pagesize (use default)
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to set geometry");
+            throw std::runtime_error(std::string("Failed to set geometry: ") + mdbx_strerror(rc));
         }
 
         rc = mdbx_env_open(env_,
@@ -397,19 +404,20 @@ private:
                            MDBX_NOSUBDIR | MDBX_WRITEMAP | MDBX_MAPASYNC | MDBX_NORDAHEAD,
                            0664);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to open environment");
+            // throw std::runtime_error("Failed to open environment");
+            throw std::runtime_error(std::string("Failed to open environment: ") + mdbx_strerror(rc));
         }
 
         MDBX_txn* txn;
         rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         rc = mdbx_dbi_open(txn, nullptr, MDBX_CREATE | MDBX_INTEGERKEY, &dbi_);
         if(rc != MDBX_SUCCESS) {
             mdbx_txn_abort(txn);
-            throw std::runtime_error("Failed to open database");
+            throw std::runtime_error(std::string("Failed to open database: ") + mdbx_strerror(rc));
         }
 
         rc = mdbx_txn_commit(txn);
@@ -444,7 +452,7 @@ public:
             }
         };
 
-        auto write_batch = [&](MDBX_txn* txn) {
+        auto write_batch = [&](MDBX_txn* txn) -> int {
             for(const auto& [numeric_id, meta] : batch) {
                 msgpack::sbuffer sbuf;
                 msgpack::pack(sbuf, meta);
@@ -454,6 +462,7 @@ public:
 
                 int rc = mdbx_put(txn, dbi_, &key, &data, MDBX_UPSERT);
                 if(rc != MDBX_SUCCESS) {
+                    return rc;
                 }
             }
             return MDBX_SUCCESS;
@@ -462,14 +471,14 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         rc = write_batch(txn);
         // MDBX auto-grows, no manual resize needed
         if(rc != MDBX_SUCCESS) {
             mdbx_txn_abort(txn);
-            throw std::runtime_error("Failed to store meta");
+            throw std::runtime_error(std::string("Failed to store meta: ") + mdbx_strerror(rc));
         }
 
         try_commit(txn);
@@ -480,7 +489,7 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         try {
@@ -506,7 +515,7 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != MDBX_SUCCESS) {
-            throw std::runtime_error("Failed to begin transaction");
+            throw std::runtime_error(std::string("Failed to begin transaction: ") + mdbx_strerror(rc));
         }
 
         try {
@@ -514,12 +523,12 @@ public:
 
             rc = mdbx_del(txn, dbi_, &key, nullptr);
             if(rc != MDBX_SUCCESS && rc != MDBX_NOTFOUND) {
-                throw std::runtime_error("Failed to delete metadata");
+                throw std::runtime_error(std::string("Failed to delete metadata: ") + mdbx_strerror(rc));
             }
 
             rc = mdbx_txn_commit(txn);
             if(rc != MDBX_SUCCESS) {
-                throw std::runtime_error("Failed to commit metadata deletion");
+                throw std::runtime_error(std::string("Failed to commit metadata deletion: ") + mdbx_strerror(rc));
             }
         } catch(...) {
             mdbx_txn_abort(txn);
